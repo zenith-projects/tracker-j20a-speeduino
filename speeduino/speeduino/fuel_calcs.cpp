@@ -84,6 +84,12 @@ TESTABLE_INLINE_STATIC uint16_t calculatePWLimit(const config2 &page2, const sta
 
 
 static inline uint32_t applyMapMode(uint32_t intermediate, const config2 &page2, const statuses &current) {
+  // MAF already measured the air mass. The synthetic kPa has to scale the
+  // pulse or the VE table would have to carry the whole airflow shape.
+  if (page2.fuelAlgorithm == LOAD_SOURCE_MAF) {
+    uint16_t multiplier = div100(lshift<7U>((uint32_t)current.mafLoad));
+    return rshift<7U>(intermediate * (uint32_t)multiplier);
+  }
   if ( page2.multiplyMAP == MULTIPLY_MAP_MODE_100) { 
     uint16_t multiplier = div100(lshift<7U>((uint32_t)current.MAP));
     return rshift<7U>(intermediate * (uint32_t)multiplier); 

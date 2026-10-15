@@ -386,4 +386,8 @@ struct statuses {
   vvtStatus_t vvt2;
 
   launchStatus_t launchStatus;
+
+  uint16_t mafADC;   ///< Filtered MAF ADC (0-1023). Only valid when a load source is MAF.
+  uint16_t mafFlow;  ///< MAF reading in 0.1 g/s, after the calibration curve.
+  uint16_t mafLoad;  ///< Synthetic kPa used as fuel/ignition load when the algorithm is MAF.
 };

@@ -361,6 +361,10 @@ byte getTSLogEntry(uint16_t byteNum)
     case 137: statusValue = highByte(fuelSchedule8.pw); break;
 #endif
     case 138: statusValue = currentStatus.systemTemp; break;
+    case 139: statusValue = lowByte(currentStatus.mafADC); break;
+    case 140: statusValue = highByte(currentStatus.mafADC); break;
+    case 141: statusValue = lowByte(currentStatus.mafFlow); break;
+    case 142: statusValue = highByte(currentStatus.mafFlow); break;
     default: statusValue = 0; // MISRA check
   }
 
@@ -708,7 +712,7 @@ bool is2ByteEntry(uint8_t key)
   // This array indicates which index values from the log are 2 byte values
   // This array MUST remain in ascending order
   // !!!! WARNING: If any value above 255 is required in this array, changes MUST be made to is2ByteEntry() function !!!!
-  static constexpr byte PROGMEM fsIntIndex[] = {4, 14, 17, 22, 26, 28, 33, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 76, 78, 80, 82, 86, 88, 90, 93, 95, 99, 104, 111, 121, 125, 130, 132, 134, 136 };
+  static constexpr byte PROGMEM fsIntIndex[] = {4, 14, 17, 22, 26, 28, 33, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 76, 78, 80, 82, 86, 88, 90, 93, 95, 99, 104, 111, 121, 125, 130, 132, 134, 136, 139, 141 };
 
   unsigned int bot = 0U;
   unsigned int mid = _countof(fsIntIndex);

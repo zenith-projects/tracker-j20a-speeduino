@@ -229,6 +229,7 @@ using table2D_u8_u8_10 = table2D<uint8_t, uint8_t, 10U>;
 using table2D_u16_u8_32 = table2D<uint16_t, uint8_t, 32U>;
 using table2D_u16_u16_32 = table2D<uint16_t, uint16_t, 32U>;
 using table2D_u8_u16_4 = table2D<uint8_t, uint16_t, 4U>;
+using table2D_u8_u16_16 = table2D<uint8_t, uint16_t, 16U>;
 using table2D_u8_s16_6 = table2D<uint8_t, int16_t, 6U>;
 
 #endif // TABLE_H

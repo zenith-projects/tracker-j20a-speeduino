@@ -28,6 +28,7 @@ A full copy of the license may be found in the projects root directory
 #include "decoders.h"
 #include "src/pins/boardInputPin.h"
 #include "src/pins/pinMapping.h"
+#include "maf.h"
 
 uint8_t statusSensors = 0;
 
@@ -538,6 +539,32 @@ TESTABLE_INLINE_STATIC bool applyMapAlgorithm(const config2 &page2,
   return readingIsValid;
 }
 
+static table2D_u8_u16_16 mafFlowTable(&configPage15.mafBins, &configPage15.mafFlow);
+
+static inline void readMAF(void)
+{
+  bool mafSelected = (configPage2.fuelAlgorithm == LOAD_SOURCE_MAF)
+                  || (configPage2.ignAlgorithm == LOAD_SOURCE_MAF)
+                  || (configPage10.fuel2Algorithm == LOAD_SOURCE_MAF)
+                  || (configPage10.spark2Algorithm == LOAD_SOURCE_MAF);
+  if (!mafSelected)
+  {
+    return;
+  }
+
+  uint8_t pin = pinNumbers.pinMAP;
+  if ((configPage15.mafPin >= 1U) && (configPage15.mafPin <= 16U))
+  {
+    pin = pinTranslateAnalog(configPage15.mafPin - 1U);
+  }
+
+  uint16_t adc = readAnalogSensor(pin);
+  currentStatus.mafADC = LOW_PASS_FILTER(adc, configPage4.ADCFILTER_MAP, currentStatus.mafADC);
+  uint16_t flow = table2D_getValue(&mafFlowTable, (uint8_t)(currentStatus.mafADC >> 2U));
+  currentStatus.mafFlow = flow;
+  currentStatus.mafLoad = mafSyntheticKpa(flow, currentStatus.RPM, configPage2.nCylinders, configPage2.strokes, configPage15.mafRefMg);
+}
+
 static inline void readMAP(void)
 {
   // Read sensor(s). Saves filtered ADC readings. Does not set calibrated MAP and EMAP values.
@@ -920,6 +947,7 @@ BEGIN_LTO_ALWAYS_INLINE(void) readPolledSensors(byte loopTimer)
     {BAT_READ_TIMER_BIT, readBat},
     {BARO_READ_TIMER_BIT, readBaro},
     {MAP_READ_TIMER_BIT, readMAP},
+    {MAP_READ_TIMER_BIT, readMAF},
 #if defined(ANALOG_ISR)
     {BIT_TIMER_200HZ, enableAnalogIsr},
 #endif

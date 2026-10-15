@@ -224,7 +224,7 @@ struct config2 : public config_page_t {
 
   //config2 in ini
   // cppcheck-suppress misra-c2012-6.1
-  LoadSource fuelAlgorithm : 3;///< Fuel algorithm - 0=Manifold pressure/MAP (LOAD_SOURCE_MAP, default, proven), 1=Throttle/TPS (LOAD_SOURCE_TPS), 2=IMAP/EMAP (LOAD_SOURCE_IMAPEMAP)
+  LoadSource fuelAlgorithm : 3;///< Fuel algorithm - 0=MAP, 1=TPS, 2=IMAP/EMAP, 3=MAF (LOAD_SOURCE_MAF)
   byte fixAngEnable : 1; ///< Whether fixed/locked timing is enabled (0=disable, 1=enable, See @ref config4.FixAng)
   byte nInjectors : 4;   ///< Number of injectors
 
@@ -924,7 +924,12 @@ struct config15 : public config_page_t {
   int8_t rollingProtRPMDelta[4]; // Signed RPM value representing how much below the RPM limit. Divided by 10
   byte rollingProtCutPercent[4];
   
-  //Bytes 106-255
-  byte Unused15_106_255[150];
+  //Bytes 106-255. MAF calibration lives here; the rest of the page stays spare.
+  byte mafPin;            ///< 0 = MAP analog input. 1..16 = A0..A15.
+  byte mafPad;
+  byte mafBins[16];       ///< ADC/4 (0 = 0 V, 255 = 5 V). Must be ascending.
+  uint16_t mafFlow[16];   ///< Airflow at each bin, in 0.1 g/s.
+  uint16_t mafRefMg;      ///< mg of air in one cylinder at 100 kPa, 20 C, 100% VE.
+  byte Unused15_158_255[98];
 
 } __attribute__((packed,aligned(__alignof__(uint16_t)))); //The 32 bit systems require all structs to be fully packed, aligned to their largest member type 
