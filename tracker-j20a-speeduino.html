@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tracker J20A Speeduino</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Literata:opsz,wght@7..72,460;7..72,650&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --board: #d5ddd4;
+      --mask: #1b3530;
+      --silk: #e7f0df;
+      --ink: #14211c;
+      --muted: #3e524b;
+      --copper: #b56a3c;
+      --paper: #f4efe4;
+      --rule: #c9bfae;
+      --focus: #0e6b5c;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% -10%, #edf3ea 0 18%, transparent 42%),
+        var(--board);
+      font-family: "Literata", Palatino, serif;
+      font-size: 1.05rem;
+      line-height: 1.55;
+    }
+
+    .wrap {
+      width: min(1080px, calc(100% - 2rem));
+      margin: 0 auto;
+      padding: 1.5rem 0 3rem;
+    }
+
+    header.silk {
+      background: var(--mask);
+      color: var(--silk);
+      padding: 1.2rem 1.25rem 0;
+      border-radius: 2px 18px 0 0;
+    }
+
+    .vehicle {
+      margin: 0;
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      font-weight: 600;
+      font-size: clamp(3.4rem, 9vw, 5.6rem);
+      line-height: 0.84;
+    }
+
+    .motor {
+      margin: 0.2rem 0 0;
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      font-weight: 500;
+      font-size: clamp(1.35rem, 2.4vw, 1.85rem);
+    }
+
+    .lede {
+      max-width: 40rem;
+      margin: 0.7rem 0 1rem;
+      color: #d5e4d4;
+      font-size: 1rem;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 0.35rem;
+      overflow-x: auto;
+      padding-bottom: 0.7rem;
+    }
+
+    .tabs button {
+      appearance: none;
+      border: 0;
+      background: #2a4a44;
+      color: var(--silk);
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      font-size: 1.15rem;
+      padding: 0.4rem 0.75rem 0.45rem;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .tabs button[aria-selected="true"] {
+      background: var(--copper);
+      color: #1a120c;
+    }
+
+    .tabs button:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible,
+    button.save:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 3px;
+    }
+
+    main {
+      background: var(--paper);
+      padding: 1.2rem 1.25rem 1.5rem;
+    }
+
+    h2, h3 {
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      font-weight: 600;
+      letter-spacing: 0;
+      line-height: 1.15;
+    }
+
+    h2 { margin: 0 0 0.6rem; font-size: 1.85rem; }
+    h3 { margin: 1.35rem 0 0.35rem; font-size: 1.4rem; }
+
+    p { margin: 0.45rem 0; max-width: 68ch; }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin: 0.8rem 0 0.2rem;
+    }
+
+    .plate {
+      background: #efe6d2;
+      padding: 0.85rem 0.95rem 1rem;
+      border-top: 4px solid var(--copper);
+    }
+
+    .plate h3 { margin-top: 0; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0.6rem 0 0.3rem;
+      font-size: 0.98rem;
+    }
+
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 0.38rem 0.45rem 0.38rem 0;
+      border-bottom: 1px solid var(--rule);
+    }
+
+    th {
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      font-weight: 600;
+      font-size: 1.05rem;
+    }
+
+    .sensor {
+      padding: 0.75rem 0;
+      border-top: 1px solid var(--rule);
+    }
+
+    .sensor h3 { margin-top: 0; }
+
+    .find {
+      width: min(22rem, 100%);
+      margin: 0.2rem 0 0.6rem;
+      border: 0;
+      border-bottom: 1px solid #8d8474;
+      background: transparent;
+      color: var(--ink);
+      font: inherit;
+      padding: 0.3rem 0;
+    }
+
+    code {
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      font-size: 1.05rem;
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    ol, ul { margin: 0.35rem 0 0.4rem; padding-left: 1.2rem; max-width: 68ch; }
+    li { margin: 0.2rem 0; }
+
+    .log {
+      margin-top: 1rem;
+      padding-top: 0.8rem;
+      border-top: 1px solid var(--rule);
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 4.5rem;
+      margin-top: 0.3rem;
+      border: 1px solid #8d8474;
+      background: rgba(255, 255, 255, 0.45);
+      color: var(--ink);
+      font: inherit;
+      padding: 0.45rem 0.55rem;
+    }
+
+    .row { display: flex; gap: 0.7rem; align-items: center; margin-top: 0.55rem; }
+
+    button.save {
+      appearance: none;
+      border: 0;
+      background: var(--mask);
+      color: var(--silk);
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      font-size: 1.1rem;
+      padding: 0.4rem 0.8rem;
+      cursor: pointer;
+    }
+
+    .entries { list-style: none; margin: 0.6rem 0 0; padding: 0; }
+    .entries li { padding: 0.45rem 0; border-top: 1px solid var(--rule); }
+    .entries time {
+      display: block;
+      font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+      color: var(--muted);
+    }
+
+    footer {
+      margin-top: 0.8rem;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    footer p { max-width: none; }
+
+    @media (max-width: 760px) {
+      .split { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="silk">
+      <p class="vehicle">Tracker</p>
+      <p class="motor">2008 brasileira · J20A</p>
+      <p class="lede">Chevrolet Tracker 2008, motor J20A 2.0 16V a gasolina. Os números saem do manual do proprietário desse ano.</p>
+      <nav class="tabs" role="tablist" aria-label="Assuntos">
+        <button role="tab" id="tab-mecanica" aria-controls="mecanica" aria-selected="true">Mecânica</button>
+        <button role="tab" id="tab-eletronica" aria-controls="eletronica" aria-selected="false">Eletrônica</button>
+        <button role="tab" id="tab-sensores" aria-controls="sensores" aria-selected="false">Sensores</button>
+        <button role="tab" id="tab-injecao" aria-controls="injecao" aria-selected="false">Injeção</button>
+        <button role="tab" id="tab-codigos" aria-controls="codigos" aria-selected="false">Códigos</button>
+        <button role="tab" id="tab-speeduino" aria-controls="speeduino" aria-selected="false">Speeduino</button>
+      </nav>
+    </header>
+
+    <main>
+      <section role="tabpanel" id="mecanica" aria-labelledby="tab-mecanica">
+        <h2>Mecânica</h2>
+        <p>Motor longitudinal dianteiro, quatro cilindros em linha, cinco mancais, 16 válvulas, duplo comando. Gasolina.</p>
+        <table>
+          <tbody>
+            <tr><th>Veículo</th><td>Chevrolet Tracker 2008, Brasil</td></tr>
+            <tr><th>Motor</th><td>J20A, 2.0L MPFI 16V</td></tr>
+            <tr><th>Cilindrada</th><td>1.995 cm³</td></tr>
+            <tr><th>Diâmetro × curso</th><td>84 × 90 mm</td></tr>
+            <tr><th>Taxa de compressão</th><td>9,3:1</td></tr>
+            <tr><th>Potência</th><td>128 cv (94 kW) a 5.900 rpm, NBR ISO 1585</td></tr>
+            <tr><th>Torque</th><td>174 N·m (17,7 kgf·m) a 4.300 rpm, NBR ISO 1585</td></tr>
+            <tr><th>Ordem de ignição</th><td>1-3-4-2</td></tr>
+            <tr><th>Marcha lenta</th><td>750 ± 50 rpm com o ar-condicionado desligado. 800 ± 50 rpm com o ar-condicionado ligado.</td></tr>
+            <tr><th>Óleo do motor</th><td>Cárter sem filtro 5,4 L. Filtro 0,2 L. SAE 10W30, 10W40, 10W50, 15W40, 15W50 ou 20W50, API SE a SL ou superior.</td></tr>
+            <tr><th>Arrefecimento</th><td>6,5 L, radiador incluso. Aditivo ACDelco de longa duração, 35% a 50%, resto água potável.</td></tr>
+            <tr><th>Combustível</th><td>Tanque 66 L. Reserva 5 L.</td></tr>
+            <tr><th>Velas</th><td>Denso K20PR-U11 ou SK16PR11. NGK BKR6E-11 ou IFR5J11. Folga 1,0 a 1,1 mm.</td></tr>
+            <tr><th>Elétrica</th><td>Bateria 12 V, 48 Ah. Alternador 70 A.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section role="tabpanel" id="eletronica" aria-labelledby="tab-eletronica" hidden>
+        <h2>Eletrônica</h2>
+        <p>Injeção eletrônica multiponto. Na partida o acelerador fica solto: a central define a mistura e a marcha lenta. O carro tem imobilizador na chave.</p>
+        <table>
+          <tbody>
+            <tr><th>Central</th><td>Mitsubishi SMFI. O diagrama de oficina do Tracker 2.0 16V 128 cv traz o motor como J20A.</td></tr>
+            <tr><th>Ignição</th><td>Bobina de três pinos com módulo, cabos até as quatro velas. Catálogo da Tracker 2008: Gauss GC4562 e Vetor EBI7616.</td></tr>
+            <tr><th>Borboleta</th><td>Sensor de posição de três pinos. Códigos 13420-65D00, 13420-65D01, 13420-52D00 e 91175256.</td></tr>
+            <tr><th>Virabrequim</th><td>Sensor de três pinos, código de reposição J5T23191.</td></tr>
+            <tr><th>Diagnóstico</th><td>Conector OBD-II. ELM327 lê os parâmetros do J20A dessa Tracker.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section role="tabpanel" id="sensores" aria-labelledby="tab-sensores" hidden>
+        <h2>Sensores</h2>
+        <p>Peças de reposição aplicadas à Tracker 2008 2.0 16V a gasolina, motor J20A.</p>
+        <table>
+          <tbody>
+            <tr><th>TPS</th><td>Potenciômetro de três pinos no corpo da borboleta. Alimentação 5 V, terra e sinal. Fechada, o sinal fica na parte baixa da escala; aberta, sobe em direção aos 5 V.</td></tr>
+            <tr><th>CKP</th><td>Três pinos, J5T23191. Informa rotação e posição do virabrequim para o ponto e para o tempo de injeção. A contagem de dentes da roda se mede no motor.</td></tr>
+            <tr><th>ECT</th><td>Termistor do líquido de arrefecimento. A resistência cai com o aumento da temperatura. A central usa esse valor na partida e na marcha lenta.</td></tr>
+            <tr><th>Sonda lambda</th><td>Sinal de malha fechada da injeção multiponto. O ELM327 dessa Tracker lê o parâmetro junto com os demais dados do J20A.</td></tr>
+            <tr><th>Bobina</th><td>Três pinos, com módulo interno. Uma bobina e quatro cabos. GC4562 / EBI7616.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section role="tabpanel" id="injecao" aria-labelledby="tab-injecao" hidden>
+        <h2>Injeção</h2>
+        <p>MPFI, um bico por cilindro, ordem de ignição 1-3-4-2. A central Mitsubishi calcula o tempo de abertura e segura a lenta em 750 ± 50 rpm, ou 800 ± 50 rpm com o ar-condicionado ligado.</p>
+        <table>
+          <tbody>
+            <tr><th>Bicos da Tracker 2008</th><td>O código vai gravado no corpo. Nesta leva aparece Nikki CDH-210, também INP-771, ou Bosch 0280150943.</td></tr>
+            <tr><th>CDH-210</th><td>Corpo EV6, quatro furos, conector Sumitomo. Catálogo: cerca de 230 cm³/min a 3 bar, resistência 12,5 a 14,5 Ω.</td></tr>
+            <tr><th>0280150943</th><td>Bico Bosch usado em parte das Tracker 2008. Vazão e resistência se medem na peça, não se copiam do CDH-210.</td></tr>
+            <tr><th>Combustível</th><td>Gasolina. Tanque 66 L, reserva 5 L. A pressão de linha não está no manual de 2008; mede-se na galeria.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section role="tabpanel" id="codigos" aria-labelledby="tab-codigos" hidden>
+        <h2>Códigos</h2>
+        <p>OBD-II lido na Tracker 2008 com motor J20A. O dígito final dos bicos é o número do cilindro.</p>
+        <input class="find" id="code-filter" type="search" placeholder="Filtrar por código ou peça" aria-label="Filtrar códigos">
+        <table id="codes">
+          <thead>
+            <tr><th>Código</th><th>O que a central viu</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>P0117</code> <code>P0118</code></td><td>Sensor de temperatura do líquido, circuito baixo ou alto.</td></tr>
+            <tr><td><code>P0122</code> <code>P0123</code></td><td>Sensor de posição da borboleta, sinal baixo ou alto.</td></tr>
+            <tr><td><code>P0130</code> <code>P0134</code></td><td>Sonda lambda, circuito aberto, tensão baixa, tensão alta, resposta lenta ou sem atividade.</td></tr>
+            <tr><td><code>P0171</code></td><td>Mistura pobre além da correção da central.</td></tr>
+            <tr><td><code>P0172</code></td><td>Mistura rica além da correção da central.</td></tr>
+            <tr><td><code>P0201</code> <code>P0202</code> <code>P0203</code> <code>P0204</code></td><td>Circuito do bico do cilindro 1, 2, 3 ou 4.</td></tr>
+            <tr><td><code>P0300</code></td><td>Falha de combustão em mais de um cilindro.</td></tr>
+            <tr><td><code>P0301</code> <code>P0302</code> <code>P0303</code> <code>P0304</code></td><td>Falha de combustão no cilindro indicado.</td></tr>
+            <tr><td><code>P0335</code></td><td>Circuito do sensor de virabrequim.</td></tr>
+            <tr><td><code>P0350</code></td><td>Circuito primário da bobina.</td></tr>
+          </tbody>
+        </table>
+        <p class="note" id="code-empty" hidden>Nenhum código com esse texto.</p>
+      </section>
+
+      <section role="tabpanel" id="speeduino" aria-labelledby="tab-speeduino" hidden>
+        <h2>Speeduino</h2>
+        <p>A placa entra no lugar da central Mitsubishi desta Tracker 2008. O ar passa a ser calculado por pressão no coletor, rotação e temperatura do ar.</p>
+        <table>
+          <tbody>
+            <tr><th>Virabrequim</th><td>O J5T23191 tem três pinos. A entrada da Speeduino recebe onda quadrada de 0 a 5 V. Sinal indutivo passa pelo condicionador VR. Decoders sem sensor de comando: 4-1, 12-1, 36-1 e 60-2. A contagem é a da roda deste motor. O ângulo de trigger é o giro, em graus, do PMS do cilindro 1 até o primeiro dente depois da falha, no sentido de rotação. A lâmpada de ponto confere esse número.</td></tr>
+            <tr><th>MAP</th><td>MPX4250 da placa oficial, 250 kPa de fundo de escala.</td></tr>
+            <tr><th>Temperaturas</th><td>ECT e IAT são termistores de dois fios, um fio no terra da ECU. A curva entra com três pontos medidos nos sensores do carro.</td></tr>
+            <tr><th>TPS</th><td>Os três fios do sensor original. Calibrar fechado e totalmente aberto no corpo desta Tracker.</td></tr>
+            <tr><th>Lenta</th><td>Alvo original: 750 ± 50 rpm, 800 ± 50 rpm com ar-condicionado. A placa tem saída de motor de passo e saída PWM.</td></tr>
+            <tr><th>Sonda</th><td>Narrowband na entrada O2, ou wideband com controlador próprio. A placa lê o sinal já convertido.</td></tr>
+            <tr><th>Bicos</th><td>Quatro saídas, disparo na ordem 1, 2, 3, 4, fiadas na ordem de ignição 1-3-4-2. Saída saturada acima de cerca de 8 Ω. O CDH-210 de catálogo, 12,5 a 14,5 Ω, fica nessa faixa. O 0280150943 entra depois de medida a resistência. Sequencial pede um pulso de comando por ciclo.</td></tr>
+            <tr><th>Bobina</th><td>GC4562 / EBI7616, três pinos, módulo interno. A saída da Speeduino é sinal lógico e liga no módulo. Uma saída comanda a bobina. Em faísca perdida o mesmo pulso ocorre também no tempo de escape.</td></tr>
+            <tr><th>Required fuel</th><td>Vazão do bico gravado no carro e pressão medida na galeria. Para o CDH-210 o catálogo dá cerca de 230 cm³/min a 3 bar.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="log" aria-labelledby="log-title">
+        <h2 id="log-title">Notas desta bancada</h2>
+        <form id="log-form">
+          <label for="note">O que foi medido ou mudado</label>
+          <textarea id="note" required placeholder="Ex.: bobina é a de 3 pinos; sensor do virabrequim tem 36 dentes e 1 falha."></textarea>
+          <div class="row">
+            <button class="save" type="submit">Guardar nota</button>
+            <p class="note" id="status" role="status"></p>
+          </div>
+        </form>
+        <ol class="entries" id="entries"></ol>
+      </section>
+    </main>
+    <footer>
+      <p>Fontes: manual do proprietário Chevrolet Tracker 2008, Brasil; diagrama Mitsubishi SMFI do Tracker 2.0 16V 128 cv J20A; catálogos da bobina GC4562 / EBI7616 e dos bicos CDH-210 e 0280150943 para a Tracker 2008; manual da Speeduino.</p>
+    </footer>
+  </div>
+  <script>
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+
+    function selectTab(tab) {
+      tabs.forEach((item) => {
+        const on = item === tab;
+        item.setAttribute("aria-selected", String(on));
+        item.tabIndex = on ? 0 : -1;
+      });
+      panels.forEach((panel) => {
+        panel.hidden = panel.id !== tab.getAttribute("aria-controls");
+      });
+      tab.focus();
+    }
+
+    tabs.forEach((tab, index) => {
+      tab.tabIndex = index === 0 ? 0 : -1;
+      tab.addEventListener("click", () => selectTab(tab));
+      tab.addEventListener("keydown", (event) => {
+        if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return;
+        const next = event.key === "ArrowRight" ? index + 1 : index - 1;
+        selectTab(tabs[(next + tabs.length) % tabs.length]);
+      });
+    });
+
+    const filter = document.getElementById("code-filter");
+    const rows = [...document.querySelectorAll("#codes tbody tr")];
+    const empty = document.getElementById("code-empty");
+    filter.addEventListener("input", () => {
+      const query = filter.value.trim().toLowerCase();
+      let shown = 0;
+      rows.forEach((row) => {
+        const match = row.textContent.toLowerCase().includes(query);
+        row.hidden = !match;
+        if (match) shown += 1;
+      });
+      empty.hidden = shown !== 0;
+    });
+
+    const storageKey = "tracker-j20a-speeduino";
+    function loadNotes() {
+      try {
+        const data = JSON.parse(localStorage.getItem(storageKey) || "{}");
+        return Array.isArray(data.notes) ? data.notes : [];
+      } catch {
+        return [];
+      }
+    }
+    let notes = loadNotes();
+    const entries = document.getElementById("entries");
+
+    function renderNotes() {
+      entries.replaceChildren();
+      [...notes].reverse().forEach((entry) => {
+        const item = document.createElement("li");
+        const time = document.createElement("time");
+        time.dateTime = entry.at;
+        time.textContent = new Date(entry.at).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+        const text = document.createElement("p");
+        text.textContent = entry.text;
+        item.append(time, text);
+        entries.appendChild(item);
+      });
+    }
+
+    document.getElementById("log-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const field = document.getElementById("note");
+      const text = field.value.trim();
+      if (!text) return;
+      notes.push({ at: new Date().toISOString(), text });
+      const previous = JSON.parse(localStorage.getItem(storageKey) || "{}");
+      previous.notes = notes;
+      localStorage.setItem(storageKey, JSON.stringify(previous));
+      field.value = "";
+      document.getElementById("status").textContent = "Nota guardada neste navegador.";
+      renderNotes();
+    });
+    renderNotes();
+  </script>
+</body>
+</html>
