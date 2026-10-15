@@ -16,7 +16,10 @@ enum LoadSource {
   /** Ratio of intake pressure to exhaust pressure.
    * A variation of the standard MAP that uses the ratio of inlet manifold pressure to exhaust manifold pressure,
    * something that is particularly useful on turbo engines. */
-  LOAD_SOURCE_IMAPEMAP
+  LOAD_SOURCE_IMAPEMAP,
+  /** Mass airflow. getLoad returns a synthetic kPa derived from the MAF
+   * curve so the VE table and the MAP multiplier stay in the same units. */
+  LOAD_SOURCE_MAF
 };
 
 /**
@@ -36,6 +39,10 @@ static inline uint16_t getLoad(LoadSource algorithm, const statuses &current) {
   {
     //IMAP / EMAP
     return fast_div32_16((uint32_t)current.MAP * 100UL, current.EMAP);
+  }
+  else if (algorithm == LOAD_SOURCE_MAF)
+  {
+    return current.mafLoad;
   } else {
     // LOAD_SOURCE_MAP (the default). Aka Speed Density
     return current.MAP;

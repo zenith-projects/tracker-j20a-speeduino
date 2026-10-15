@@ -1,0 +1,519 @@
+//! Data logging Tauri commands.
+
+use libretune_core::datalog::DataLogger;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crate::paths::get_app_data_dir;
+use crate::state::AppState;
+
+/// If `logger` is actively recording, stops it and returns `true`. Pulled
+/// out of `stop_recording_on_definition_change` so the actual stop/preserve
+/// behavior is unit-testable without constructing a full `AppState`.
+fn stop_if_recording(logger: &mut DataLogger) -> bool {
+    if logger.is_recording() {
+        logger.stop();
+        true
+    } else {
+        false
+    }
+}
+
+/// Stops any in-progress recording. Call this from every place that
+/// overwrites `state.definition` (reconnect to a different ECU, load a
+/// different INI, toggle demo mode, open a different project). A running
+/// recording's channel list was resolved against the OLD definition;
+/// continuing to record against a new one can silently record all-zero
+/// columns for channels that no longer exist, or worse, real values from a
+/// same-named channel with different units/scale into the same CSV column
+/// with no indication anything changed. Fail closed instead: stop the
+/// recording (preserving what was already collected) rather than let it
+/// silently keep going against data it was never validated against.
+pub(crate) async fn stop_recording_on_definition_change(state: &AppState) {
+    let mut logger = state.data_logger.lock().await;
+    if stop_if_recording(&mut logger) {
+        eprintln!(
+            "[WARN] Data logging stopped: ECU definition changed mid-recording. \
+             Existing entries are preserved; start a new recording to continue."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stops_an_active_recording() {
+        let mut logger = DataLogger::new(vec!["rpm".to_string()]);
+        logger.start();
+        assert!(logger.is_recording());
+
+        assert!(stop_if_recording(&mut logger));
+        assert!(!logger.is_recording());
+    }
+
+    #[test]
+    fn no_op_when_not_recording() {
+        let mut logger = DataLogger::new(vec!["rpm".to_string()]);
+        assert!(!logger.is_recording());
+
+        assert!(!stop_if_recording(&mut logger));
+        assert!(!logger.is_recording());
+    }
+
+    #[test]
+    fn preserves_already_recorded_entries() {
+        let mut logger = DataLogger::new(vec!["rpm".to_string()]);
+        logger.start();
+        logger.record(vec![1234.0]);
+        assert_eq!(logger.entry_count(), 1);
+
+        stop_if_recording(&mut logger);
+        assert_eq!(logger.entry_count(), 1);
+    }
+}
+
+#[derive(Serialize)]
+pub struct LoggingStatus {
+    is_recording: bool,
+    entry_count: usize,
+    duration_ms: u64,
+    channels: Vec<String>,
+    /// Path of the file the log is streamed to (or the last finished file).
+    stream_path: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct LogEntryData {
+    timestamp_ms: u64,
+    values: HashMap<String, f64>,
+}
+
+#[tauri::command]
+pub async fn start_logging(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    sample_rate: Option<f64>,
+) -> Result<(), String> {
+    let def_guard = state.definition.lock().await;
+    let def = def_guard.as_ref().ok_or("Definition not loaded")?;
+
+    // Prefer the channel list the INI declares in [Datalog]: it names the
+    // fields this ECU expects logged, in the order it expects them. The
+    // fallback is every output channel, which came out of a HashMap - so the
+    // column order differed between runs of the same binary, and the columns
+    // themselves were raw channel names rather than the declared labels. Other
+    // log tools key off those names and that order; the INI says so itself
+    // ("programs like MSLVV and MSTweak key off specific column names").
+    let mut channels: Vec<String> = if def.datalog_entries.is_empty() {
+        let mut all: Vec<String> = def.output_channels.keys().cloned().collect();
+        all.sort();
+        all
+    } else {
+        def.datalog_entries
+            .iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.channel.clone())
+            .collect()
+    };
+
+    // Also log the canonical alias names (RPM, MAP, TPS, …) that the realtime
+    // stream adds via apply_channel_aliases, so recorded logs
+    // use the same channel names as the dashboards and graph pages.
+    let mut probe: HashMap<String, f64> = channels.iter().map(|c| (c.clone(), 0.0)).collect();
+    super::realtime_stream::apply_channel_aliases(&mut probe);
+    for name in probe.keys() {
+        if !channels.iter().any(|c| c == name) {
+            channels.push(name.clone());
+        }
+    }
+
+    // Stream to the project's datalogs/ folder, or app-data/datalogs when no
+    // project is open. Recording without a file is not allowed — RAM is not
+    // the log.
+    let stream_dir = {
+        let proj = state.current_project.lock().await;
+        proj.as_ref()
+            .map(|p| p.path.join("datalogs"))
+            .unwrap_or_else(|| get_app_data_dir(&app).join("datalogs"))
+    };
+
+    let mut logger = state.data_logger.lock().await;
+
+    // Recording appends to the current session (one continuous log until the
+    // user clears it). Only build a fresh logger when there is no session yet
+    // or the channel set changed (e.g. a different INI was loaded).
+    let mut existing: Vec<&String> = logger.channels().iter().collect();
+    let mut incoming: Vec<&String> = channels.iter().collect();
+    existing.sort();
+    incoming.sort();
+    if existing != incoming {
+        *logger = DataLogger::new(channels);
+    }
+
+    let units: Vec<String> = logger
+        .channels()
+        .iter()
+        .map(|c| {
+            def.output_channels
+                .get(c)
+                .map(|o| o.units.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    let ini_types: Vec<String> = logger
+        .channels()
+        .iter()
+        .map(|c| {
+            def.datalog_entries
+                .iter()
+                .find(|e| e.channel == *c)
+                .map(|e| e.data_type.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    logger.set_capture_meta(
+        if def.signature.is_empty() {
+            None
+        } else {
+            Some(def.signature.clone())
+        },
+        units,
+        ini_types,
+    );
+
+    if let Some(rate) = sample_rate {
+        logger.set_sample_rate(rate);
+    }
+
+    let name = chrono::Local::now().format("%Y-%m-%d_%H.%M.%S").to_string();
+    let path = stream_dir.join(format!("{name}.ltlog"));
+    logger
+        .start_streaming(&path)
+        .map_err(|e| format!("Could not create log file {}: {e}", path.display()))?;
+    logger.start();
+    tracing::info!("streaming datalog to {}", path.display());
+
+    // Reset the dropped-sample counter for this session and mark recording
+    // active so the stream tick counts (rather than silently swallows) any
+    // sample it can't hand to the logger while the lock is busy (D10).
+    crate::state::LOGGER_SAMPLES_DROPPED.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::state::LOGGER_RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_logging(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut logger = state.data_logger.lock().await;
+    logger.stop();
+    crate::state::LOGGER_RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_logging_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<LoggingStatus, String> {
+    let logger = state.data_logger.lock().await;
+    Ok(LoggingStatus {
+        is_recording: logger.is_recording(),
+        entry_count: logger.entry_count(),
+        duration_ms: logger.duration().as_millis() as u64,
+        channels: logger.channels().to_vec(),
+        stream_path: logger.log_path().map(|p| p.display().to_string()),
+    })
+}
+
+#[tauri::command]
+pub async fn get_log_entries(
+    state: tauri::State<'_, AppState>,
+    start_index: Option<usize>,
+    count: Option<usize>,
+    channels: Option<Vec<String>>,
+) -> Result<Vec<LogEntryData>, String> {
+    let logger = state.data_logger.lock().await;
+    let all_channels = logger.channels();
+
+    // Only serialize the requested channels: an INI defines 1000+ output
+    // channels and shipping all of them per entry over IPC at high sample
+    // rates (100 Hz) is several MB per poll — enough to OOM the webview.
+    let selected: Vec<(usize, &String)> = match &channels {
+        Some(filter) => {
+            let wanted: std::collections::HashSet<&str> =
+                filter.iter().map(|s| s.as_str()).collect();
+            all_channels
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| wanted.contains(name.as_str()))
+                .collect()
+        }
+        None => all_channels.iter().enumerate().collect(),
+    };
+
+    let start = start_index.unwrap_or(0);
+    let max_count = count.unwrap_or(1000);
+
+    let entries: Vec<LogEntryData> = logger
+        .live_window(start, max_count)
+        .map(|entry| {
+            let mut values = HashMap::with_capacity(selected.len());
+            for (i, channel) in &selected {
+                if let Some(&val) = entry.values.get(*i) {
+                    values.insert((*channel).clone(), val);
+                }
+            }
+            LogEntryData {
+                timestamp_ms: entry.timestamp.as_millis() as u64,
+                values,
+            }
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+#[tauri::command]
+pub async fn clear_log(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut logger = state.data_logger.lock().await;
+    logger.clear();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_log(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    let src = {
+        let mut logger = state.data_logger.lock().await;
+        logger
+            .flush_stream()
+            .map_err(|e| format!("Failed to flush log: {e}"))?;
+        logger
+            .log_path()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| "No log file to save".to_string())?
+    };
+    if src.as_os_str() == std::path::Path::new(&path).as_os_str() {
+        return Ok(());
+    }
+    std::fs::copy(&src, &path).map_err(|e| format!("Failed to save log: {e}"))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct LoadedLogSample {
+    /// Timestamp in milliseconds, matching `parseLogFile` / DataLogView.
+    x: f64,
+    values: HashMap<String, f64>,
+}
+
+#[derive(Serialize)]
+pub struct LoadedLogFile {
+    channels: Vec<String>,
+    samples: Vec<LoadedLogSample>,
+    /// True sample count on disk (may be larger than `samples.len()`).
+    sample_count: u64,
+}
+
+/// Load a `.ltlog` / `.mlg` / `.csv` from an arbitrary path for the UI.
+///
+/// `.ltlog` is downsampled so a long session cannot fill RAM or the webview.
+#[tauri::command]
+pub async fn load_log_file(path: String) -> Result<LoadedLogFile, String> {
+    let path_ref = std::path::Path::new(&path);
+    let (channels, entries, sample_count) =
+        if libretune_core::datalog::LogFormat::from_extension(path_ref)
+            == Some(libretune_core::datalog::LogFormat::Ltlog)
+        {
+            let (schema, entries, n) = libretune_core::datalog::ltlog::downsample_ltlog(
+                &path,
+                libretune_core::datalog::ltlog::UI_SAMPLE_CAP,
+            )
+            .map_err(|e| format!("Failed to read log: {e}"))?;
+            (schema.channel_names(), entries, n)
+        } else {
+            let (channels, entries) = libretune_core::datalog::format::read_log(&path)
+                .map_err(|e| format!("Failed to read log: {e}"))?;
+            let n = entries.len() as u64;
+            (channels, entries, n)
+        };
+    let samples = entries
+        .into_iter()
+        .map(|entry| {
+            let mut values = HashMap::with_capacity(channels.len());
+            for (i, channel) in channels.iter().enumerate() {
+                if let Some(&val) = entry.values.get(i) {
+                    values.insert(channel.clone(), val);
+                }
+            }
+            LoadedLogSample {
+                x: entry.timestamp.as_secs_f64() * 1000.0,
+                values,
+            }
+        })
+        .collect();
+    Ok(LoadedLogFile {
+        channels,
+        samples,
+        sample_count,
+    })
+}
+
+// Tooth/composite auto-save and graph-log setup still call these names;
+// they now go through the same user-folder fence as `commands::file_io`.
+#[tauri::command]
+pub async fn read_text_file(path: String) -> Result<String, String> {
+    crate::commands::file_io::read_file_contents(path).await
+}
+
+#[tauri::command]
+pub async fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    crate::commands::file_io::write_file_contents(path, contents).await
+}
+
+// --- AI assistant read-tool support ---------------------------------------
+//
+// Helpers for the agent's `query_datalog` tool: list the project's saved
+// logs and load one (or the in-memory session) as channels + entries. Not
+// Tauri commands themselves — only the agent executor calls them.
+
+/// One saved datalog file, as listed for the assistant.
+#[derive(Serialize)]
+pub(crate) struct DatalogListing {
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified: String,
+}
+
+/// List the readable logs in the project's `datalogs/` folder, newest first.
+/// Returns an empty list when no project is open or the folder doesn't
+/// exist yet.
+pub(crate) async fn list_datalog_files(state: &AppState) -> Vec<DatalogListing> {
+    let dir = {
+        let proj = state.current_project.lock().await;
+        match proj.as_ref() {
+            Some(p) => p.path.join("datalogs"),
+            None => return Vec::new(),
+        }
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut listings: Vec<(std::time::SystemTime, DatalogListing)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            // Only formats the loader can read back are worth listing.
+            libretune_core::datalog::LogFormat::from_extension(&path)?;
+            let meta = e.metadata().ok()?;
+            let modified = meta
+                .modified()
+                .ok()
+                .map(|t| {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.to_rfc3339()
+                })
+                .unwrap_or_default();
+            Some((
+                meta.modified().ok().unwrap_or(std::time::UNIX_EPOCH),
+                DatalogListing {
+                    name: path.file_name()?.to_string_lossy().to_string(),
+                    size_bytes: meta.len(),
+                    modified,
+                },
+            ))
+        })
+        .collect();
+    listings.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    listings.into_iter().map(|(_, l)| l).collect()
+}
+
+/// The data the `query_datalog` tool works over.
+///
+/// `.ltlog` is referenced by path and streamed; only a tiny in-memory tail is
+/// kept when there is no file yet.
+pub(crate) struct DatalogData {
+    pub channels: Vec<String>,
+    pub source: String,
+    pub path: Option<PathBuf>,
+    pub tail: Vec<libretune_core::datalog::LogEntry>,
+}
+
+impl DatalogData {
+    /// Walk samples without requiring the whole log in RAM.
+    pub(crate) fn for_each<F>(&self, mut f: F) -> Result<(), String>
+    where
+        F: FnMut(&libretune_core::datalog::LogEntry),
+    {
+        if let Some(path) = &self.path {
+            libretune_core::datalog::format::visit_log(path, |e| {
+                f(e);
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        } else {
+            for e in &self.tail {
+                f(e);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Load a saved log by file name from the project's `datalogs/` folder.
+/// Rejects names that contain path separators — the tool only ever names
+/// files inside that folder.
+pub(crate) async fn load_datalog_file(state: &AppState, name: &str) -> Result<DatalogData, String> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("invalid log name '{name}'"));
+    }
+    let dir = {
+        let proj = state.current_project.lock().await;
+        proj.as_ref()
+            .map(|p| p.path.join("datalogs"))
+            .ok_or_else(|| "No project loaded".to_string())?
+    };
+    let path = dir.join(name);
+    if libretune_core::datalog::LogFormat::from_extension(&path)
+        == Some(libretune_core::datalog::LogFormat::Ltlog)
+    {
+        let schema = libretune_core::datalog::ltlog::read_ltlog_schema(&path)
+            .map_err(|e| format!("could not read log '{name}': {e}"))?;
+        return Ok(DatalogData {
+            channels: schema.channel_names(),
+            source: name.to_string(),
+            path: Some(path),
+            tail: Vec::new(),
+        });
+    }
+    let (channels, entries) = libretune_core::datalog::format::read_log(&path)
+        .map_err(|e| format!("could not read log '{name}': {e}"))?;
+    Ok(DatalogData {
+        channels,
+        source: name.to_string(),
+        path: None,
+        tail: entries,
+    })
+}
+
+/// Snapshot the current logging session without loading the file into RAM.
+pub(crate) async fn current_session_datalog(state: &AppState) -> DatalogData {
+    let mut logger = state.data_logger.lock().await;
+    let _ = logger.flush_stream();
+    let channels = logger.channels().to_vec();
+    if let Some(path) = logger.log_path().map(|p| p.to_path_buf()) {
+        return DatalogData {
+            channels,
+            source: "current session".to_string(),
+            path: Some(path),
+            tail: Vec::new(),
+        };
+    }
+    DatalogData {
+        channels,
+        source: "current session".to_string(),
+        path: None,
+        tail: logger.entries().cloned().collect(),
+    }
+}

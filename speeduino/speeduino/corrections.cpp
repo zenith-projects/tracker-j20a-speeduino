@@ -833,10 +833,16 @@ uint16_t correctionsFuel(void)
   //Voltage correction is applied to the injector opening time
   currentStatus.batCorrection = correctionBatVoltage();
   
-  currentStatus.iatCorrection = correctionIATDensity();
+  // A MAF already reports mass, so air density and barometric pressure are
+  // inside the measurement. Applying those curves again would add fuel twice.
+  if (configPage2.fuelAlgorithm == LOAD_SOURCE_MAF) {
+    currentStatus.iatCorrection = NO_FUEL_CORRECTION;
+    currentStatus.baroCorrection = NO_FUEL_CORRECTION;
+  } else {
+    currentStatus.iatCorrection = correctionIATDensity();
+    currentStatus.baroCorrection = correctionBaro();
+  }
   sumCorrections = combineCorrections(sumCorrections, currentStatus.iatCorrection);
-
-  currentStatus.baroCorrection = correctionBaro();
   sumCorrections = combineCorrections(sumCorrections, currentStatus.baroCorrection);
 
   currentStatus.flexCorrection = correctionFlex();

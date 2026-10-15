@@ -1,0 +1,1909 @@
+//! Tune file handling
+//!
+//! Supports .msq (XML) and JSON tune file formats.
+//! MSQ is the standard TunerStudio-compatible format used by Speeduino, MS, rusEFI, etc.
+
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::Path;
+
+/// A tune file containing ECU configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuneFile {
+    /// File format version
+    pub version: String,
+
+    /// ECU signature this tune is for
+    pub signature: String,
+
+    /// Author/creator name
+    pub author: Option<String>,
+
+    /// Description/notes
+    pub description: Option<String>,
+
+    /// Creation timestamp
+    pub created: Option<String>,
+
+    /// Last modified timestamp
+    pub modified: Option<String>,
+
+    /// Page data (page number -> raw bytes)
+    pub pages: HashMap<u8, Vec<u8>>,
+
+    /// Named constant overrides (for human-readable format)
+    pub constants: HashMap<String, TuneValue>,
+
+    /// Page number for each constant (constant name -> page number)
+    /// This preserves the MSQ file structure where constants are organized by page
+    pub constant_pages: HashMap<String, u8>,
+    /// Per-constant display metadata, preserved across a load/save cycle.
+    #[serde(default)]
+    pub constant_attrs: HashMap<String, ConstantAttrs>,
+    /// Declared byte size of each page, from `<page number="N" size="M">`.
+    #[serde(default)]
+    pub page_sizes: HashMap<u8, String>,
+    /// The `<settings>` block, verbatim.
+    ///
+    /// Records which `#if` symbols the values were authored under - `CELSIUS`,
+    /// `AFR` and so on. Those decide scale AND translate for about thirty
+    /// temperature constants, so a file without it cannot be re-read correctly
+    /// on its own. The reference writer emits it with the comment "These
+    /// setting are only used if this msq is opened without a project."
+    #[serde(default)]
+    pub ecu_settings: Vec<String>,
+
+    /// PC Variables (local-only, not stored on ECU)
+    /// These are stored on page "-1" in TunerStudio format
+    #[serde(default)]
+    pub pc_variables: HashMap<String, TuneValue>,
+
+    /// INI metadata for version tracking (added in v1.1)
+    /// Contains hash and spec version of INI used when tune was saved
+    #[serde(default)]
+    pub ini_metadata: Option<IniMetadata>,
+
+    /// Constant manifest for migration detection (added in v1.1)
+    /// Lists all constants with their types/offsets at save time
+    #[serde(default)]
+    pub constant_manifest: Option<Vec<ConstantManifestEntry>>,
+
+    /// User annotations / notes on specific constants or table cells
+    /// Key format: "constant_name" for scalars, "table_name:row:col" for cells
+    #[serde(default)]
+    pub annotations: HashMap<String, TuneAnnotation>,
+
+    /// Human-readable firmware identifier (e.g. "Speeduino 202405"). Optional;
+    /// emitted as `firmwareInfo` on `<versionInfo>` for stock-TS interop
+    /// (spec §3 / Plan Phase 3.5). Falls back to `signature` when absent.
+    #[serde(default)]
+    pub firmware_info: Option<String>,
+}
+
+/// A user annotation attached to a constant, table, or cell
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuneAnnotation {
+    /// The annotation text / note
+    pub text: String,
+    /// Author who created this annotation
+    pub author: Option<String>,
+    /// ISO 8601 timestamp when created
+    pub created: String,
+    /// ISO 8601 timestamp when last modified
+    pub modified: Option<String>,
+    /// Optional severity/priority tag
+    pub tag: Option<AnnotationTag>,
+}
+
+/// Tags for categorizing annotations
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AnnotationTag {
+    /// Informational note
+    Info,
+    /// Something that needs attention
+    Warning,
+    /// Critical issue that must be fixed
+    Critical,
+    /// Successful tuning achievement
+    Success,
+    /// Reminder for future tuning session
+    Todo,
+}
+
+/// A value in a tune file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TuneValue {
+    Scalar(f64),
+    Array(Vec<f64>),
+    String(String),
+    Bool(bool),
+}
+
+/// INI metadata stored with tune files for version tracking
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IniMetadata {
+    /// ECU signature from the INI file
+    pub signature: String,
+
+    /// INI filename (e.g., "speeduino.ini")
+    pub name: String,
+
+    /// SHA-256 hash of INI structural content (constants, pages, offsets)
+    pub hash: String,
+
+    /// INI spec version (from [MegaTune] section)
+    pub spec_version: String,
+
+    /// Timestamp when tune was saved with this INI
+    pub saved_at: String,
+}
+
+/// Display metadata a `.msq` carries on each `<constant>` tag.
+///
+/// Held as strings and written back verbatim: this is round-trip preservation,
+/// not interpretation. The writer used to emit `<constant name="...">` and
+/// nothing else, so a tune saved by LibreTune lost all 403 `digits`, 361
+/// `units` and 138 `rows`/`cols` attributes its source file carried - about
+/// thirty per cent of the file. A reader holding the matching INI can re-derive
+/// them; one without it cannot, which is what makes the file self-describing.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConstantAttrs {
+    /// Decimal places to show, from the INI's `digits` column.
+    pub digits: Option<String>,
+    /// Display units.
+    pub units: Option<String>,
+    /// Array rows, for a table or curve.
+    pub rows: Option<String>,
+    /// Array columns.
+    pub cols: Option<String>,
+}
+
+impl ConstantAttrs {
+    fn is_empty(&self) -> bool {
+        self.digits.is_none() && self.units.is_none() && self.rows.is_none() && self.cols.is_none()
+    }
+
+    /// Render as XML attributes, alphabetical and including the element's own
+    /// name, which is the order the reference writer emits - so the two files
+    /// diff cleanly against each other.
+    fn to_xml_with_name(&self, name: &str) -> String {
+        let mut attrs: Vec<(&str, String)> = vec![("name", name.to_string())];
+        for (k, v) in [
+            ("cols", &self.cols),
+            ("digits", &self.digits),
+            ("rows", &self.rows),
+            ("units", &self.units),
+        ] {
+            if let Some(v) = v {
+                attrs.push((k, v.clone()));
+            }
+        }
+        attrs.sort_by_key(|(k, _)| *k);
+        attrs
+            .iter()
+            .map(|(k, v)| format!(" {k}=\"{}\"", xml_escape(v)))
+            .collect()
+    }
+}
+
+/// Pull `digits`, `units`, `rows` and `cols` off an opening tag.
+fn parse_constant_attrs(tag: &str) -> ConstantAttrs {
+    let attr = |key: &str| -> Option<String> {
+        let needle = format!("{key}=\"");
+        let start = tag.find(&needle)? + needle.len();
+        let end = tag[start..].find('"')?;
+        Some(xml_unescape(&tag[start..start + end]))
+    };
+    ConstantAttrs {
+        digits: attr("digits"),
+        units: attr("units"),
+        rows: attr("rows"),
+        cols: attr("cols"),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConstantManifestEntry {
+    /// Constant name
+    pub name: String,
+
+    /// Data type string (e.g., "U08", "S16", "array[16x16]")
+    pub data_type: String,
+
+    /// ECU page number
+    pub page: u8,
+
+    /// Byte offset within page
+    pub offset: u16,
+
+    /// Scale factor
+    pub scale: f64,
+
+    /// Translation offset
+    pub translate: f64,
+}
+
+impl TuneFile {
+    /// Create a new empty tune file
+    pub fn new(signature: impl Into<String>) -> Self {
+        let now = Utc::now().to_rfc3339();
+        Self {
+            version: "1.1".to_string(),
+            signature: signature.into(),
+            author: None,
+            description: None,
+            created: Some(now.clone()),
+            modified: Some(now),
+            pages: HashMap::new(),
+            constants: HashMap::new(),
+            constant_pages: HashMap::new(),
+            constant_attrs: HashMap::new(),
+            page_sizes: HashMap::new(),
+            ecu_settings: Vec::new(),
+            pc_variables: HashMap::new(),
+            ini_metadata: None,
+            constant_manifest: None,
+            annotations: HashMap::new(),
+            firmware_info: None,
+        }
+    }
+
+    /// Sanitize corrupted string values that may contain raw XML fragments
+    /// This is a migration fix for tunes saved with an older buggy parser
+    /// that didn't properly detect self-closing XML tags
+    fn sanitize_corrupted_strings(&mut self) {
+        let mut fixed_count = 0;
+
+        // Check constants
+        for (name, value) in self.constants.iter_mut() {
+            if let TuneValue::String(s) = value {
+                // Detect XML fragments that shouldn't be in string values
+                if s.starts_with('<') && (s.contains("constant") || s.contains("pcVariable")) {
+                    eprintln!(
+                        "[MIGRATION] Fixing corrupted string value for '{}': was '{}'",
+                        name, s
+                    );
+                    *value = TuneValue::String(String::new());
+                    fixed_count += 1;
+                }
+            }
+        }
+
+        // Check pcVariables too
+        for (name, value) in self.pc_variables.iter_mut() {
+            if let TuneValue::String(s) = value {
+                if s.starts_with('<') && (s.contains("constant") || s.contains("pcVariable")) {
+                    eprintln!(
+                        "[MIGRATION] Fixing corrupted pcVariable value for '{}': was '{}'",
+                        name, s
+                    );
+                    *value = TuneValue::String(String::new());
+                    fixed_count += 1;
+                }
+            }
+        }
+
+        if fixed_count > 0 {
+            eprintln!(
+                "[MIGRATION] Fixed {} corrupted string values from old parser bug",
+                fixed_count
+            );
+        }
+    }
+
+    /// Load a tune file from disk
+    ///
+    /// MSQ files may use ISO-8859-1 (Latin-1) encoding, so we read as bytes
+    /// and convert to UTF-8 to handle non-ASCII characters.
+    pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref();
+
+        // Read as bytes first to handle different encodings
+        let bytes = fs::read(path)?;
+
+        // Try UTF-8 first, fall back to ISO-8859-1 (Latin-1) conversion
+        let content = match String::from_utf8(bytes.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                // ISO-8859-1 is a direct byte-to-codepoint mapping
+                bytes.iter().map(|&b| b as char).collect()
+            }
+        };
+
+        // Detect format by extension and parse
+        let mut tune = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            Some("msq") => Self::parse_msq(&content),
+            Some("json") => serde_json::from_str(&content)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            _ => {
+                // Try JSON first, then MSQ
+                serde_json::from_str(&content)
+                    .or_else(|_| Self::parse_msq(&content))
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            }
+        }?;
+
+        // Sanitize any corrupted string values (migration fix for older saved tunes)
+        tune.sanitize_corrupted_strings();
+
+        Ok(tune)
+    }
+
+    /// Parse MSQ XML format
+    fn parse_msq(content: &str) -> io::Result<Self> {
+        // MSQ format is XML with constants and pcVariables as elements
+        // Example:
+        // <?xml version="1.0" encoding="ISO-8859-1"?>
+        // <msq xmlns="http://www.msefi.com/:msq">
+        // <versionInfo signature="rusEFI master.2025.07.30.uaefi.3074276223"/>
+        // <page number="0">
+        //   <constant name="engineType">"MINIMAL_PINS"</constant>
+        //   <pcVariable name="tsCanId">"0"</pcVariable>
+        // </page>
+        // </msq>
+
+        let mut tune = TuneFile::default();
+
+        // Extract signature from <versionInfo> tag (preferred) or <msq> attribute (fallback)
+        if let Some(version_start) = content.find("<versionInfo") {
+            if let Some(sig_start) = content[version_start..].find("signature=\"") {
+                let sig_content = &content[version_start + sig_start + 11..];
+                if let Some(sig_end) = sig_content.find('"') {
+                    tune.signature = xml_unescape(&sig_content[..sig_end]);
+                }
+            }
+        } else if let Some(sig_start) = content.find("signature=\"") {
+            // Fallback to <msq signature="..."> format
+            let sig_content = &content[sig_start + 11..];
+            if let Some(sig_end) = sig_content.find('"') {
+                tune.signature = xml_unescape(&sig_content[..sig_end]);
+            }
+        }
+
+        // Extract bibliography metadata (author, writeDate, etc.)
+        if let Some(bib_start) = content.find("<bibliography") {
+            // Find author
+            if let Some(auth_start) = content[bib_start..].find("author=\"") {
+                let auth_content = &content[bib_start + auth_start + 8..];
+                if let Some(auth_end) = auth_content.find('"') {
+                    tune.author = Some(xml_unescape(&auth_content[..auth_end]));
+                }
+            }
+            // Find writeDate (last modified)
+            if let Some(write_start) = content[bib_start..].find("writeDate=\"") {
+                let write_content = &content[bib_start + write_start + 11..];
+                if let Some(write_end) = write_content.find('"') {
+                    tune.modified = Some(xml_unescape(&write_content[..write_end]));
+                }
+            }
+            // Find created date
+            if let Some(created_start) = content[bib_start..].find("created=\"") {
+                let created_content = &content[bib_start + created_start + 9..];
+                if let Some(created_end) = created_content.find('"') {
+                    tune.created = Some(xml_unescape(&created_content[..created_end]));
+                }
+            }
+        } else if let Some(ts_start) = content.find("timestamp=\"") {
+            // Fallback to <msq timestamp="..."> format
+            let ts_content = &content[ts_start + 11..];
+            if let Some(ts_end) = ts_content.find('"') {
+                tune.modified = Some(ts_content[..ts_end].to_string());
+            }
+        }
+
+        // Parse iniMetadata section (LibreTune 1.1+ format for version tracking)
+        if let Some(ini_start) = content.find("<iniMetadata") {
+            let ini_remaining = &content[ini_start..];
+            let mut metadata = IniMetadata::default();
+
+            // Extract each attribute
+            if let Some(attr_start) = ini_remaining.find("signature=\"") {
+                let attr_content = &ini_remaining[attr_start + 11..];
+                if let Some(attr_end) = attr_content.find('"') {
+                    metadata.signature = xml_unescape(&attr_content[..attr_end]);
+                }
+            }
+            if let Some(attr_start) = ini_remaining.find("name=\"") {
+                let attr_content = &ini_remaining[attr_start + 6..];
+                if let Some(attr_end) = attr_content.find('"') {
+                    metadata.name = xml_unescape(&attr_content[..attr_end]);
+                }
+            }
+            if let Some(attr_start) = ini_remaining.find("hash=\"") {
+                let attr_content = &ini_remaining[attr_start + 6..];
+                if let Some(attr_end) = attr_content.find('"') {
+                    metadata.hash = xml_unescape(&attr_content[..attr_end]);
+                }
+            }
+            if let Some(attr_start) = ini_remaining.find("specVersion=\"") {
+                let attr_content = &ini_remaining[attr_start + 13..];
+                if let Some(attr_end) = attr_content.find('"') {
+                    metadata.spec_version = xml_unescape(&attr_content[..attr_end]);
+                }
+            }
+            if let Some(attr_start) = ini_remaining.find("savedAt=\"") {
+                let attr_content = &ini_remaining[attr_start + 9..];
+                if let Some(attr_end) = attr_content.find('"') {
+                    metadata.saved_at = xml_unescape(&attr_content[..attr_end]);
+                }
+            }
+
+            tune.ini_metadata = Some(metadata);
+        }
+
+        // Parse constantManifest section (LibreTune 1.1+ format for migration detection)
+        if let Some(manifest_start) = content.find("<constantManifest>") {
+            if let Some(manifest_end) = content[manifest_start..].find("</constantManifest>") {
+                let manifest_content = &content[manifest_start..manifest_start + manifest_end];
+                let mut manifest = Vec::new();
+
+                // Parse each <entry> element
+                let mut entry_pos = 0;
+                while let Some(entry_start) = manifest_content[entry_pos..].find("<entry ") {
+                    let abs_entry_start = entry_pos + entry_start;
+                    let entry_remaining = &manifest_content[abs_entry_start..];
+
+                    let mut entry = ConstantManifestEntry {
+                        name: String::new(),
+                        data_type: String::new(),
+                        page: 0,
+                        offset: 0,
+                        scale: 1.0,
+                        translate: 0.0,
+                    };
+
+                    // Extract attributes
+                    if let Some(attr_start) = entry_remaining.find("name=\"") {
+                        let attr_content = &entry_remaining[attr_start + 6..];
+                        if let Some(attr_end) = attr_content.find('"') {
+                            entry.name = xml_unescape(&attr_content[..attr_end]);
+                        }
+                    }
+                    if let Some(attr_start) = entry_remaining.find("type=\"") {
+                        let attr_content = &entry_remaining[attr_start + 6..];
+                        if let Some(attr_end) = attr_content.find('"') {
+                            entry.data_type = xml_unescape(&attr_content[..attr_end]);
+                        }
+                    }
+                    if let Some(attr_start) = entry_remaining.find("page=\"") {
+                        let attr_content = &entry_remaining[attr_start + 6..];
+                        if let Some(attr_end) = attr_content.find('"') {
+                            entry.page = attr_content[..attr_end].parse().unwrap_or(0);
+                        }
+                    }
+                    if let Some(attr_start) = entry_remaining.find("offset=\"") {
+                        let attr_content = &entry_remaining[attr_start + 8..];
+                        if let Some(attr_end) = attr_content.find('"') {
+                            entry.offset = attr_content[..attr_end].parse().unwrap_or(0);
+                        }
+                    }
+                    if let Some(attr_start) = entry_remaining.find("scale=\"") {
+                        let attr_content = &entry_remaining[attr_start + 7..];
+                        if let Some(attr_end) = attr_content.find('"') {
+                            entry.scale = attr_content[..attr_end].parse().unwrap_or(1.0);
+                        }
+                    }
+                    if let Some(attr_start) = entry_remaining.find("translate=\"") {
+                        let attr_content = &entry_remaining[attr_start + 11..];
+                        if let Some(attr_end) = attr_content.find('"') {
+                            entry.translate = attr_content[..attr_end].parse().unwrap_or(0.0);
+                        }
+                    }
+
+                    if !entry.name.is_empty() {
+                        manifest.push(entry);
+                    }
+
+                    entry_pos = abs_entry_start + 1;
+                }
+
+                if !manifest.is_empty() {
+                    tune.constant_manifest = Some(manifest);
+                }
+            }
+        }
+
+        // Helper function to parse a value string
+        fn parse_value(value_str: &str) -> TuneValue {
+            // Remove surrounding quotes if present
+            let trimmed = value_str.trim();
+            let was_quoted =
+                trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2;
+            let unquoted = if was_quoted {
+                &trimmed[1..trimmed.len() - 1]
+            } else {
+                trimmed
+            };
+
+            // A quoted value in an MSQ is an option label, never a scalar.
+            //
+            // TunerStudio writes scalar constants unquoted (`<constant
+            // name="reqFuel">12.6</constant>`) and `bits` constants quoted with
+            // the selected option's label (`<constant
+            // name="iacChannels">"1"</constant>`). Numeric-looking labels are
+            // common: `iacChannels` is `["1", "2"]` and `idleAdvDelay` is
+            // `["0.0", "0.5", "1.0", ...]`.
+            //
+            // Coercing those to `TuneValue::Scalar` made consumers treat the
+            // label as a raw bit index: `apply_tune`'s bits path uses a `Scalar`
+            // directly as the index but resolves a `String` through
+            // `bit_options`. So `"1"` on `["1", "2"]` selected option 1 ("2")
+            // instead of option 0 ("1"), and `"1.0"` on `idleAdvDelay` selected
+            // "0.5". It also round-tripped as a bare number on save, dropping
+            // the quotes and corrupting the file for TunerStudio too.
+            //
+            // Keep quoted values as strings so the bit_options lookup applies.
+            if was_quoted {
+                if unquoted == "true" || unquoted == "false" {
+                    return TuneValue::Bool(unquoted == "true");
+                }
+                // The writer XML-escapes the payload; decode it symmetrically.
+                return TuneValue::String(xml_unescape(unquoted));
+            }
+
+            // Unquoted values: check if it's an array (brackets or multiple space-separated numbers)
+            if unquoted.starts_with('[') && unquoted.ends_with(']') {
+                // Explicit array notation
+                let clean = unquoted.trim_start_matches('[').trim_end_matches(']');
+                let values: Vec<f64> = clean
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<f64>().ok())
+                    .collect();
+                if values.len() > 1 {
+                    TuneValue::Array(values)
+                } else if values.len() == 1 {
+                    TuneValue::Scalar(values[0])
+                } else {
+                    TuneValue::String(unquoted.to_string())
+                }
+            } else if unquoted.contains(' ') || unquoted.contains('\n') {
+                // Has spaces/newlines - try to parse as array of numbers
+                // But only if all parts are numeric
+                let parts: Vec<&str> = unquoted
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let values: Vec<f64> = parts.iter().filter_map(|s| s.parse::<f64>().ok()).collect();
+                // Only treat as array if ALL parts were numeric and we got multiple values
+                if values.len() > 1 && values.len() == parts.len() {
+                    TuneValue::Array(values)
+                } else if values.len() == 1 && parts.len() == 1 {
+                    // Single numeric value
+                    TuneValue::Scalar(values[0])
+                } else {
+                    // Contains non-numeric parts - treat as string
+                    TuneValue::String(unquoted.to_string())
+                }
+            } else if let Ok(val) = unquoted.parse::<f64>() {
+                TuneValue::Scalar(val)
+            } else if unquoted == "true" || unquoted == "false" {
+                TuneValue::Bool(unquoted == "true")
+            } else {
+                TuneValue::String(unquoted.to_string())
+            }
+        }
+
+        // Parse pageData elements FIRST (raw binary page data as base)
+        // Constants parsed later will override individual values in the pages
+        // Format: <pageData page="N">hexcontent</pageData>
+        let mut page_data_pos = 0;
+        while page_data_pos < content.len() {
+            if let Some(pd_start) = content[page_data_pos..].find("<pageData") {
+                let abs_pd_start = page_data_pos + pd_start;
+                let pd_remaining = &content[abs_pd_start..];
+
+                // Extract page="N" attribute
+                if let Some(page_attr_start) = pd_remaining.find("page=\"") {
+                    let page_num_content = &pd_remaining[page_attr_start + 6..];
+                    if let Some(page_num_end) = page_num_content.find('"') {
+                        if let Ok(page_num) = page_num_content[..page_num_end].parse::<u8>() {
+                            // Find the > after attributes
+                            if let Some(tag_end) = pd_remaining.find('>') {
+                                let after_tag = &pd_remaining[tag_end + 1..];
+                                // Find closing </pageData>
+                                if let Some(close_tag) = after_tag.find("</pageData>") {
+                                    let hex_content = after_tag[..close_tag].trim();
+                                    // Decode hex to bytes (2 chars per byte, lowercase)
+                                    let mut bytes = Vec::with_capacity(hex_content.len() / 2);
+                                    let mut chars =
+                                        hex_content.chars().filter(|c| !c.is_whitespace());
+                                    while let Some(high) = chars.next() {
+                                        let low = match chars.next() {
+                                            Some(c) => c,
+                                            None => break,
+                                        };
+                                        if let (Some(h), Some(l)) =
+                                            (high.to_digit(16), low.to_digit(16))
+                                        {
+                                            bytes.push(((h << 4) | l) as u8);
+                                        }
+                                    }
+                                    if !bytes.is_empty() {
+                                        tune.pages.insert(page_num, bytes);
+                                    }
+                                    page_data_pos = abs_pd_start + tag_end + 1 + close_tag + 11;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                page_data_pos = abs_pd_start + 1;
+            } else {
+                break;
+            }
+        }
+
+        // Page sizes ride on the opening tag: <page number="1" size="288">.
+        // Kept so a saved file still declares them.
+        for cap in content.match_indices("<page ") {
+            let tail = &content[cap.0..];
+            let Some(tag_end) = tail.find('>') else {
+                continue;
+            };
+            let tag = &tail[..tag_end];
+            let attr = |key: &str| -> Option<String> {
+                let needle = format!("{key}=\"");
+                let start = tag.find(&needle)? + needle.len();
+                let end = tag[start..].find('"')?;
+                Some(tag[start..start + end].to_string())
+            };
+            if let (Some(num), Some(size)) = (attr("number"), attr("size")) {
+                if let Ok(n) = num.parse::<u8>() {
+                    tune.page_sizes.insert(n, size);
+                }
+            }
+        }
+
+        // The <settings> block records which #if symbols the values were
+        // authored under. Names only; the reference writer emits one per line.
+        if let Some(start) = content.find("<settings") {
+            if let Some(end) = content[start..].find("</settings>") {
+                let block = &content[start..start + end];
+                let mut pos = 0;
+                while let Some(i) = block[pos..].find("<setting name=\"") {
+                    let abs = pos + i + 15;
+                    let Some(q) = block[abs..].find('"') else {
+                        break;
+                    };
+                    tune.ecu_settings.push(xml_unescape(&block[abs..abs + q]));
+                    pos = abs + q;
+                }
+            }
+        }
+
+        // Parse page structure and extract constants/pcVariables with their page numbers
+        // MSQ format: <page number="0"> ... <constant name="...">...</constant> ... </page>
+        let mut current_page: u8 = 0; // Default to page 0 if no page tags found
+        let mut search_pos = 0;
+        let mut constants_found = 0;
+        let mut pcvars_found = 0;
+
+        // First pass: find all <page number="N"> tags and track page boundaries
+        // Then extract constants/pcVariables within each page
+        while search_pos < content.len() {
+            // Look for <page number="N"> tag
+            if let Some(page_start) = content[search_pos..].find("<page") {
+                let abs_page_start = search_pos + page_start;
+                let page_remaining = &content[abs_page_start..];
+
+                // Extract page number
+                if let Some(num_start) = page_remaining.find("number=\"") {
+                    let num_content = &page_remaining[num_start + 8..];
+                    if let Some(num_end) = num_content.find('"') {
+                        if let Ok(page_num) = num_content[..num_end].parse::<u8>() {
+                            current_page = page_num;
+                        }
+                    }
+                }
+
+                // Find the closing </page> tag for this page
+                if let Some(page_end) = page_remaining.find("</page>") {
+                    let page_content = &page_remaining[..page_end];
+
+                    // Extract constants from this page
+                    let mut const_pos = 0;
+                    while let Some(const_start) = page_content[const_pos..].find("<constant") {
+                        let abs_const_start = const_pos + const_start;
+                        let const_remaining = &page_content[abs_const_start..];
+
+                        if let Some(name_attr_start) = const_remaining.find("name=\"") {
+                            let name_start = name_attr_start + 6;
+                            if let Some(name_end) = const_remaining[name_start..].find('"') {
+                                let name = xml_unescape(
+                                    &const_remaining[name_start..name_start + name_end],
+                                );
+
+                                if let Some(tag_end) = const_remaining.find('>') {
+                                    // Check for self-closing tag: <constant name="..."/> or <constant name="..." />
+                                    // Look at the content before '>' to see if it contains '/'
+                                    let tag_content = &const_remaining[..tag_end];
+                                    let attrs = parse_constant_attrs(tag_content);
+                                    if !attrs.is_empty() {
+                                        tune.constant_attrs.insert(name.clone(), attrs);
+                                    }
+                                    if tag_content.trim_end().ends_with('/') {
+                                        // Self-closing tag - value is empty
+                                        let value = TuneValue::String(String::new());
+                                        tune.constants.insert(name.clone(), value);
+                                        tune.constant_pages.insert(name, current_page);
+                                        constants_found += 1;
+                                        const_pos = abs_const_start + tag_end + 1;
+                                        continue;
+                                    }
+                                    let value_start = tag_end + 1;
+                                    if let Some(close_tag) =
+                                        const_remaining[value_start..].find("</constant>")
+                                    {
+                                        let value_str = const_remaining
+                                            [value_start..value_start + close_tag]
+                                            .trim();
+                                        let value = parse_value(value_str);
+                                        tune.constants.insert(name.clone(), value);
+                                        tune.constant_pages.insert(name, current_page);
+                                        constants_found += 1;
+                                        const_pos = abs_const_start + value_start + close_tag + 11;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        const_pos = abs_const_start + 1;
+                    }
+
+                    // Extract pcVariables from this page
+                    let mut pc_pos = 0;
+                    while let Some(pc_start) = page_content[pc_pos..].find("<pcVariable") {
+                        let abs_pc_start = pc_pos + pc_start;
+                        let pc_remaining = &page_content[abs_pc_start..];
+
+                        if let Some(name_attr_start) = pc_remaining.find("name=\"") {
+                            let name_start = name_attr_start + 6;
+                            if let Some(name_end) = pc_remaining[name_start..].find('"') {
+                                let name =
+                                    xml_unescape(&pc_remaining[name_start..name_start + name_end]);
+
+                                if let Some(tag_end) = pc_remaining.find('>') {
+                                    // Check for self-closing tag: <pcVariable name="..."/> or <pcVariable name="..." />
+                                    let tag_content = &pc_remaining[..tag_end];
+                                    // pcVariables carry the same display
+                                    // metadata as constants: 27 of this file's
+                                    // 37 declare digits, and the six array ones
+                                    // declare rows/cols.
+                                    let attrs = parse_constant_attrs(tag_content);
+                                    if !attrs.is_empty() {
+                                        tune.constant_attrs.insert(name.clone(), attrs);
+                                    }
+                                    if tag_content.trim_end().ends_with('/') {
+                                        // Self-closing tag - value is empty
+                                        let value = TuneValue::String(String::new());
+                                        tune.pc_variables.insert(name, value);
+                                        pcvars_found += 1;
+                                        pc_pos = abs_pc_start + tag_end + 1;
+                                        continue;
+                                    }
+                                    let value_start = tag_end + 1;
+                                    if let Some(close_tag) =
+                                        pc_remaining[value_start..].find("</pcVariable>")
+                                    {
+                                        let value_str = pc_remaining
+                                            [value_start..value_start + close_tag]
+                                            .trim();
+                                        let value = parse_value(value_str);
+                                        // Store in pc_variables, not constants
+                                        tune.pc_variables.insert(name, value);
+                                        pcvars_found += 1;
+                                        pc_pos = abs_pc_start + value_start + close_tag + 13;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        pc_pos = abs_pc_start + 1;
+                    }
+
+                    search_pos = abs_page_start + page_end + 7; // Move past </page>
+                    continue;
+                }
+            }
+
+            // If no page tags found, fall back to old method (for compatibility)
+            // But only if we haven't found any page-structured content
+            if constants_found == 0 && pcvars_found == 0 {
+                // Extract constants without page structure (legacy format)
+                if let Some(const_start) = content[search_pos..].find("<constant") {
+                    let abs_start = search_pos + const_start;
+                    let remaining = &content[abs_start..];
+
+                    if let Some(name_attr_start) = remaining.find("name=\"") {
+                        let name_start = name_attr_start + 6;
+                        if let Some(name_end) = remaining[name_start..].find('"') {
+                            let name = xml_unescape(&remaining[name_start..name_start + name_end]);
+
+                            if let Some(tag_end) = remaining.find('>') {
+                                // Check for self-closing tag: <constant name="..."/> or <constant name="..." />
+                                let tag_content = &remaining[..tag_end];
+                                if tag_content.trim_end().ends_with('/') {
+                                    // Self-closing tag - value is empty
+                                    let value = TuneValue::String(String::new());
+                                    tune.constants.insert(name.clone(), value);
+                                    tune.constant_pages.insert(name, current_page);
+                                    constants_found += 1;
+                                    search_pos = abs_start + tag_end + 1;
+                                    continue;
+                                }
+                                let value_start = tag_end + 1;
+                                if let Some(close_tag) =
+                                    remaining[value_start..].find("</constant>")
+                                {
+                                    let value_str =
+                                        remaining[value_start..value_start + close_tag].trim();
+                                    let value = parse_value(value_str);
+                                    tune.constants.insert(name.clone(), value);
+                                    tune.constant_pages.insert(name, current_page);
+                                    constants_found += 1;
+                                    search_pos = abs_start + value_start + close_tag + 11;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    search_pos = abs_start + 1;
+                } else if let Some(pc_start) = content[search_pos..].find("<pcVariable") {
+                    let abs_start = search_pos + pc_start;
+                    let remaining = &content[abs_start..];
+
+                    if let Some(name_attr_start) = remaining.find("name=\"") {
+                        let name_start = name_attr_start + 6;
+                        if let Some(name_end) = remaining[name_start..].find('"') {
+                            let name = xml_unescape(&remaining[name_start..name_start + name_end]);
+
+                            if let Some(tag_end) = remaining.find('>') {
+                                // Check for self-closing tag: <pcVariable name="..."/> or <pcVariable name="..." />
+                                let tag_content = &remaining[..tag_end];
+                                if tag_content.trim_end().ends_with('/') {
+                                    // Self-closing tag - value is empty
+                                    let value = TuneValue::String(String::new());
+                                    tune.pc_variables.insert(name, value);
+                                    pcvars_found += 1;
+                                    search_pos = abs_start + tag_end + 1;
+                                    continue;
+                                }
+                                let value_start = tag_end + 1;
+                                if let Some(close_tag) =
+                                    remaining[value_start..].find("</pcVariable>")
+                                {
+                                    let value_str =
+                                        remaining[value_start..value_start + close_tag].trim();
+                                    let value = parse_value(value_str);
+                                    // Store in pc_variables, not constants
+                                    tune.pc_variables.insert(name, value);
+                                    pcvars_found += 1;
+                                    search_pos = abs_start + value_start + close_tag + 13;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    search_pos = abs_start + 1;
+                } else {
+                    break; // No more constants or pcVariables
+                }
+            } else {
+                break; // Already processed page-structured content
+            }
+        }
+
+        tracing::debug!(
+            "parse_msq: Extracted {} constants and {} pcVariables from MSQ file",
+            constants_found,
+            pcvars_found
+        );
+
+        // If we found no constants and no signature, this isn't a valid MSQ
+        if tune.constants.is_empty() && tune.signature.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Not a valid MSQ file",
+            ));
+        }
+
+        Ok(tune)
+    }
+
+    /// Save the tune file to disk
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let path = path.as_ref();
+
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            Some("msq") => self.save_msq(path),
+            Some("json") | None => {
+                let content = serde_json::to_string_pretty(self)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                fs::write(path, content)
+            }
+            Some(ext) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Unknown format: {}", ext),
+            )),
+        }
+    }
+
+    /// Save as MSQ XML format
+    fn save_msq<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let mut xml = String::new();
+        xml.push_str("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n");
+
+        // Add metadata comment
+        if let Some(ref desc) = self.description {
+            xml.push_str(&format!("<!-- {} -->\n", xml_comment_escape(desc)));
+        }
+
+        // Start msq tag with signature
+        xml.push_str("<msq xmlns=\"http://www.msefi.com/:msq\">\n");
+
+        // Add versionInfo with signature, firmwareInfo, and nPages.
+        // Spec / Plan Phase 3.5: stock TunerStudio expects `firmwareInfo`
+        // and `nPages` here for max interop. Falls back to `signature`
+        // when no explicit firmware string is set.
+        let fw_info = self.firmware_info.as_deref().unwrap_or(&self.signature);
+        let n_pages = self.pages.len().max(
+            self.constant_pages
+                .values()
+                .copied()
+                .max()
+                .map(|p| p as usize + 1)
+                .unwrap_or(0),
+        );
+        xml.push_str(&format!(
+            "  <versionInfo signature=\"{}\" firmwareInfo=\"{}\" nPages=\"{}\"/>\n",
+            xml_escape(&self.signature),
+            xml_escape(fw_info),
+            n_pages
+        ));
+
+        // Add bibliography if we have metadata
+        if self.author.is_some() || self.created.is_some() || self.modified.is_some() {
+            xml.push_str("  <bibliography");
+            if let Some(ref author) = self.author {
+                xml.push_str(&format!(" author=\"{}\"", xml_escape(author)));
+            }
+            if let Some(ref created) = self.created {
+                xml.push_str(&format!(" created=\"{}\"", xml_escape(created)));
+            }
+            if let Some(ref modified) = self.modified {
+                xml.push_str(&format!(" writeDate=\"{}\"", xml_escape(modified)));
+            }
+            xml.push_str("/>\n");
+        }
+
+        // Add INI metadata for version tracking (LibreTune 1.1+)
+        if let Some(ref metadata) = self.ini_metadata {
+            xml.push_str(&format!(
+                "  <iniMetadata signature=\"{}\" name=\"{}\" hash=\"{}\" specVersion=\"{}\" savedAt=\"{}\"/>\n",
+                xml_escape(&metadata.signature),
+                xml_escape(&metadata.name),
+                xml_escape(&metadata.hash),
+                xml_escape(&metadata.spec_version),
+                xml_escape(&metadata.saved_at)
+            ));
+        }
+
+        // Add constant manifest for migration detection (LibreTune 1.1+)
+        if let Some(ref manifest) = self.constant_manifest {
+            xml.push_str("  <constantManifest>\n");
+            for entry in manifest {
+                xml.push_str(&format!(
+                    "    <entry name=\"{}\" type=\"{}\" page=\"{}\" offset=\"{}\" scale=\"{}\" translate=\"{}\"/>\n",
+                    xml_escape(&entry.name),
+                    xml_escape(&entry.data_type),
+                    entry.page,
+                    entry.offset,
+                    entry.scale,
+                    entry.translate
+                ));
+            }
+            xml.push_str("  </constantManifest>\n");
+        }
+
+        // Group constants by page number (preserve page structure)
+        let mut constants_by_page: HashMap<u8, Vec<String>> = HashMap::new();
+        for name in self.constants.keys() {
+            let page = self.constant_pages.get(name).copied().unwrap_or(0);
+            constants_by_page
+                .entry(page)
+                .or_default()
+                .push(name.clone());
+        }
+
+        // The <settings> block, before the pages, as the reference writer places
+        // it. Without it a standalone .msq does not say which #if branch its
+        // numbers were authored under, and roughly thirty temperature
+        // constants change scale AND translate between the Celsius and
+        // Fahrenheit arms.
+        if !self.ecu_settings.is_empty() {
+            xml.push_str(
+                "  <settings Comment=\"These setting are only used if this msq is opened without a project.\">
+",
+            );
+            for name in &self.ecu_settings {
+                xml.push_str(&format!(
+                    "    <setting name=\"{}\"/>
+",
+                    xml_escape(name)
+                ));
+            }
+            xml.push_str(
+                "  </settings>
+",
+            );
+        }
+
+        // Sort page numbers and constants within each page
+        let mut page_numbers: Vec<u8> = constants_by_page.keys().copied().collect();
+        page_numbers.sort();
+
+        for page_num in page_numbers {
+            match self.page_sizes.get(&page_num) {
+                Some(size) => xml.push_str(&format!(
+                    "  <page number=\"{}\" size=\"{}\">
+",
+                    page_num, size
+                )),
+                None => xml.push_str(&format!(
+                    "  <page number=\"{}\">
+",
+                    page_num
+                )),
+            }
+
+            let mut const_names = constants_by_page.remove(&page_num).unwrap_or_default();
+            const_names.sort();
+
+            for name in const_names {
+                if let Some(value) = self.constants.get(&name) {
+                    let value_str = format_tune_value(value);
+                    let attrs = self
+                        .constant_attrs
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_xml_with_name(&name);
+                    xml.push_str(&format!(
+                        "    <constant{}>{}</constant>
+",
+                        attrs, value_str
+                    ));
+                }
+            }
+
+            xml.push_str("  </page>\n");
+        }
+
+        // Add page data if present (raw binary page data).
+        //
+        // Iterate in page order rather than `HashMap` order: Rust randomises
+        // hash iteration per process, so emitting directly from the map wrote
+        // the `<pageData>` blocks in a different order on every save. An
+        // unchanged tune then serialised to a different file each time, which
+        // made the git history unusable (every commit showed the whole file as
+        // modified) and left the working tree dirty immediately after a
+        // checkout — the constants and pcVariables sections below were already
+        // sorted for the same reason.
+        let mut page_nums: Vec<&u8> = self.pages.keys().collect();
+        page_nums.sort();
+        for page_num in page_nums {
+            let data = &self.pages[page_num];
+            // Encode as hex for binary page data
+            let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
+            xml.push_str(&format!(
+                "  <pageData page=\"{}\">{}</pageData>\n",
+                page_num, hex
+            ));
+        }
+
+        // Add pcVariables on page -1 (TunerStudio convention)
+        if !self.pc_variables.is_empty() {
+            xml.push_str("  <page number=\"-1\">\n");
+
+            let mut pc_var_names: Vec<&String> = self.pc_variables.keys().collect();
+            pc_var_names.sort();
+
+            for name in pc_var_names {
+                if let Some(value) = self.pc_variables.get(name) {
+                    let value_str = format_tune_value(value);
+                    let attrs = self
+                        .constant_attrs
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_xml_with_name(name);
+                    xml.push_str(&format!(
+                        "    <pcVariable{}>{}</pcVariable>
+",
+                        attrs, value_str
+                    ));
+                }
+            }
+
+            xml.push_str("  </page>\n");
+        }
+
+        xml.push_str("</msq>\n");
+
+        fs::write(path, xml)
+    }
+
+    /// Update the modified timestamp
+    pub fn touch(&mut self) {
+        self.modified = Some(Utc::now().to_rfc3339());
+    }
+
+    /// Overlay bytes onto an existing page image. Does not create or zero-pad pages.
+    pub fn patch_page_bytes(&mut self, page: u8, offset: u16, data: &[u8]) {
+        let Some(page_data) = self.pages.get_mut(&page) else {
+            return;
+        };
+        let start = offset as usize;
+        let end = start + data.len();
+        if end <= page_data.len() {
+            page_data[start..end].copy_from_slice(data);
+        }
+    }
+
+    /// Set a page's raw data
+    pub fn set_page(&mut self, page: u8, data: Vec<u8>) {
+        self.pages.insert(page, data);
+    }
+
+    /// Get a page's raw data
+    pub fn get_page(&self, page: u8) -> Option<&[u8]> {
+        self.pages.get(&page).map(|v| v.as_slice())
+    }
+
+    /// Set a constant value
+    pub fn set_constant(&mut self, name: impl Into<String>, value: TuneValue) {
+        self.constants.insert(name.into(), value);
+    }
+
+    /// Set a constant value with its page number (preserves MSQ page structure)
+    pub fn set_constant_with_page(&mut self, name: impl Into<String>, value: TuneValue, page: u8) {
+        let name = name.into();
+        self.constants.insert(name.clone(), value);
+        self.constant_pages.insert(name, page);
+    }
+
+    /// Get a constant value
+    pub fn get_constant(&self, name: &str) -> Option<&TuneValue> {
+        self.constants.get(name)
+    }
+
+    /// Set a PC variable value
+    pub fn set_pc_variable(&mut self, name: impl Into<String>, value: TuneValue) {
+        self.pc_variables.insert(name.into(), value);
+    }
+
+    /// Get a PC variable value
+    pub fn get_pc_variable(&self, name: &str) -> Option<&TuneValue> {
+        self.pc_variables.get(name)
+    }
+
+    /// Get a value (constant or PC variable)
+    pub fn get_value(&self, name: &str) -> Option<&TuneValue> {
+        self.constants
+            .get(name)
+            .or_else(|| self.pc_variables.get(name))
+    }
+
+    /// Set an annotation on a constant, table, or cell
+    /// Key format: "constant_name" for scalars, "table_name:row:col" for cells
+    pub fn set_annotation(&mut self, key: impl Into<String>, annotation: TuneAnnotation) {
+        self.annotations.insert(key.into(), annotation);
+        self.touch();
+    }
+
+    /// Get an annotation by key
+    pub fn get_annotation(&self, key: &str) -> Option<&TuneAnnotation> {
+        self.annotations.get(key)
+    }
+
+    /// Remove an annotation by key
+    pub fn remove_annotation(&self, key: &str) -> bool {
+        // TuneFile is Clone, so we create a new map for immutable path
+        // but we only need the check
+        self.annotations.contains_key(key)
+    }
+
+    /// Remove an annotation (mutable version)
+    pub fn delete_annotation(&mut self, key: &str) -> bool {
+        let removed = self.annotations.remove(key).is_some();
+        if removed {
+            self.touch();
+        }
+        removed
+    }
+
+    /// Get all annotations for a table (any key starting with "table_name:")
+    pub fn get_table_annotations(&self, table_name: &str) -> Vec<(&String, &TuneAnnotation)> {
+        let prefix = format!("{}:", table_name);
+        self.annotations
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix) || *k == table_name)
+            .collect()
+    }
+
+    /// Get all annotations
+    pub fn all_annotations(&self) -> &HashMap<String, TuneAnnotation> {
+        &self.annotations
+    }
+
+    /// Save only PC variables to a separate file (pcVariableValues.msq format)
+    pub fn save_pc_variables<P: AsRef<Path>>(&self, path: P, signature: &str) -> io::Result<()> {
+        let mut xml = String::new();
+        xml.push_str("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n");
+        xml.push_str("<msq xmlns=\"http://www.msefi.com/:msq\">\n");
+        xml.push_str(&format!(
+            "<bibliography author=\"LibreTune\" writeDate=\"{}\"/>\n",
+            Utc::now().format("%a %b %d %H:%M:%S %Y")
+        ));
+        xml.push_str(&format!(
+            "<versionInfo fileFormat=\"4.0\" signature=\"{}\"/>\n",
+            signature
+        ));
+
+        if !self.pc_variables.is_empty() {
+            xml.push_str("<page number=\"-1\">\n");
+
+            let mut names: Vec<&String> = self.pc_variables.keys().collect();
+            names.sort();
+
+            for name in names {
+                if let Some(value) = self.pc_variables.get(name) {
+                    let value_str = format_tune_value(value);
+                    xml.push_str(&format!(
+                        "<constant name=\"{}\">{}</constant>\n",
+                        name, value_str
+                    ));
+                }
+            }
+
+            xml.push_str("</page>\n");
+        }
+
+        xml.push_str("</msq>\n");
+        fs::write(path, xml)
+    }
+
+    /// Load PC variables from a separate file (pcVariableValues.msq format)
+    pub fn load_pc_variables<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+        let loaded = Self::load(path)?;
+        // The file uses <constant> tags on page -1, but we parse them as constants
+        // We need to merge them into pc_variables
+        for (name, value) in loaded.constants {
+            self.pc_variables.insert(name, value);
+        }
+        // Also merge any pc_variables that were parsed
+        for (name, value) in loaded.pc_variables {
+            self.pc_variables.insert(name, value);
+        }
+        Ok(())
+    }
+}
+
+/// Format an `f64` as the shortest decimal that round-trips back to the same
+/// value.
+///
+/// This used to be `format!("{:.17}", v)` followed by a trailing-zero trim, but
+/// `.17` is seventeen *decimal places*, not significant digits: `14.7` is
+/// exactly `14.699999999999999289…` as an `f64`, so the trim left
+/// `14.69999999999999929` in the file. `f64`'s `Display` already emits the
+/// shortest representation that parses back exactly, which is what both
+/// TunerStudio and a human reader expect.
+fn format_f64(v: f64) -> String {
+    if !v.is_finite() {
+        // Neither `NaN` nor `inf` is a legal MSQ number; write a benign 0.
+        return "0".to_string();
+    }
+    if v == 0.0 {
+        // Also normalises `-0.0`.
+        return "0".to_string();
+    }
+    v.to_string()
+}
+
+/// Escape the five XML predefined entities so a value containing `&`, `<`,
+/// `>`, `"` or `'` cannot break the document.
+///
+/// Without this an author of `R&D` or a string constant containing `<` made
+/// the saved `.msq` malformed: TunerStudio rejects it outright, and this
+/// file's own reader — which locates a tag's end with `find('>')` and an
+/// attribute's end with the next `"` — walks straight past the attribute list.
+/// [`xml_unescape`] is its inverse, applied on the read side.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Decode the entities [`xml_escape`] writes, plus numeric character
+/// references, so a value survives a save/load round trip unchanged.
+fn xml_unescape(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let Some(semi) = tail.find(';').filter(|&i| i <= 10) else {
+            // Not an entity — a bare `&` from a file some other writer produced.
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let entity = &tail[1..semi];
+        match entity {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ => {
+                let code = entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| entity.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32);
+                match code {
+                    Some(c) => out.push(c),
+                    // Unknown entity: keep it verbatim rather than losing text.
+                    None => out.push_str(&tail[..=semi]),
+                }
+            }
+        }
+        rest = &tail[semi + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Escape a string for use inside an XML comment.
+///
+/// Comments cannot contain `--` or end with `-`, and entities are not expanded
+/// inside them, so the only safe treatment is to break up the offending runs.
+fn xml_comment_escape(s: &str) -> String {
+    let mut out = s.replace("--", "- -");
+    if out.ends_with('-') {
+        out.push(' ');
+    }
+    out
+}
+
+/// Format a TuneValue for XML output with high precision
+fn format_tune_value(value: &TuneValue) -> String {
+    match value {
+        TuneValue::Scalar(v) => format_f64(*v),
+        TuneValue::Array(arr) => arr
+            .iter()
+            .map(|v| format_f64(*v))
+            .collect::<Vec<_>>()
+            .join(" "),
+        TuneValue::String(s) => format!("\"{}\"", xml_escape(s)),
+        TuneValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+    }
+}
+
+impl Default for TuneFile {
+    fn default() -> Self {
+        Self {
+            version: "1.1".to_string(),
+            signature: String::new(),
+            author: None,
+            description: None,
+            created: None,
+            modified: None,
+            pages: HashMap::new(),
+            constants: HashMap::new(),
+            constant_pages: HashMap::new(),
+            constant_attrs: HashMap::new(),
+            page_sizes: HashMap::new(),
+            ecu_settings: Vec::new(),
+            pc_variables: HashMap::new(),
+            ini_metadata: None,
+            constant_manifest: None,
+            annotations: HashMap::new(),
+            firmware_info: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializing the same tune twice must produce identical bytes.
+    ///
+    /// `pages` is a `HashMap` and Rust randomises hash iteration per process,
+    /// so emitting `<pageData>` straight from the map reordered the blocks on
+    /// every save: an unchanged tune serialised differently each time, every
+    /// git commit showed the whole file as modified, and a checkout was dirty
+    /// the moment the tune was reloaded. Enough pages are used here that a
+    /// regression is caught rather than passing by luck.
+    #[test]
+    fn test_save_is_deterministic_across_repeated_writes() {
+        let mut tune = TuneFile::new("speeduino 202501");
+        for page in 0u8..12 {
+            tune.pages.insert(page, vec![page; 32]);
+        }
+        tune.set_constant("reqFuel", TuneValue::Scalar(12.5));
+        tune.set_constant("stoich", TuneValue::Scalar(14.7));
+
+        let dir = std::env::temp_dir().join(format!("lt_determinism_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+
+        let mut bytes: Vec<Vec<u8>> = Vec::new();
+        for i in 0..3 {
+            let p = dir.join(format!("t{}.msq", i));
+            tune.save(&p).expect("save");
+            bytes.push(fs::read(&p).expect("read"));
+        }
+
+        assert_eq!(bytes[0], bytes[1], "two saves of the same tune differ");
+        assert_eq!(bytes[1], bytes[2], "three saves of the same tune differ");
+
+        // And the page blocks must come out in page order, not hash order.
+        let text = String::from_utf8_lossy(&bytes[0]).to_string();
+        let order: Vec<u8> = text
+            .match_indices("<pageData page=\"")
+            .filter_map(|(i, m)| {
+                text[i + m.len()..]
+                    .split('"')
+                    .next()
+                    .and_then(|s| s.parse::<u8>().ok())
+            })
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(
+            order, sorted,
+            "pageData blocks are not written in page order"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tune_file_creation() {
+        let mut tune = TuneFile::new("speeduino 202310");
+        tune.set_constant("reqFuel", TuneValue::Scalar(10.5));
+
+        assert_eq!(tune.signature, "speeduino 202310");
+        assert!(tune.get_constant("reqFuel").is_some());
+    }
+
+    #[test]
+    fn test_parse_msq_self_closing_constant() {
+        // Test that self-closing tags like <constant name="vinNumber"/> are handled correctly
+        // Previously this would grab content from the next constant, causing VIN to show XML
+        let msq_content = r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE msq PUBLIC "-//rusEfi//DTD msq//EN" "msq.dtd">
+<msq version="1.0">
+  <bibliography author="LibreTune Test" tuneComment="Test tune" writeDate="2026-01-07"/>
+  <versionInfo firmwareInfo="rusEFI test"/>
+  <page number="0">
+    <constant name="vinNumber"/>
+    <constant name="engineType">25</constant>
+    <constant name="tuneHidingKey"/>
+    <constant name="someValue">42.5</constant>
+  </page>
+</msq>"#;
+
+        // Write to temp file
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join("test_self_closing.msq");
+        std::fs::write(&temp_path, msq_content).expect("Failed to write temp file");
+
+        // Parse the MSQ
+        let result = TuneFile::load(&temp_path);
+        assert!(result.is_ok(), "Failed to parse MSQ: {:?}", result.err());
+
+        let tune = result.unwrap();
+
+        // vinNumber should be empty string, NOT "25</constant>..." or other garbage
+        let vin = tune.get_constant("vinNumber");
+        assert!(vin.is_some(), "vinNumber constant not found");
+        match vin.unwrap() {
+            TuneValue::String(s) => {
+                assert!(
+                    s.is_empty(),
+                    "vinNumber should be empty for self-closing tag, got: '{}'",
+                    s
+                );
+            }
+            other => panic!(
+                "vinNumber should be String type for self-closing tag, got: {:?}",
+                other
+            ),
+        }
+
+        // engineType should be 25
+        let engine_type = tune.get_constant("engineType");
+        assert!(engine_type.is_some(), "engineType constant not found");
+        match engine_type.unwrap() {
+            TuneValue::Scalar(v) => assert_eq!(*v, 25.0),
+            other => panic!("engineType should be Scalar, got: {:?}", other),
+        }
+
+        // someValue should be 42.5
+        let some_value = tune.get_constant("someValue");
+        assert!(some_value.is_some(), "someValue constant not found");
+        match some_value.unwrap() {
+            TuneValue::Scalar(v) => assert_eq!(*v, 42.5),
+            other => panic!("someValue should be Scalar, got: {:?}", other),
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn test_parse_msq_page_data() {
+        // Test that <pageData page="N">hexcontent</pageData> is parsed correctly
+        // pageData provides raw binary page data which constants can override
+        let msq_content = r#"<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE msq PUBLIC "-//rusEfi//DTD msq//EN" "msq.dtd">
+<msq version="1.0">
+  <bibliography author="LibreTune Test" tuneComment="Test tune" writeDate="2026-01-11"/>
+  <versionInfo firmwareInfo="rusEFI test"/>
+  <pageData page="0">0102030405060708</pageData>
+  <pageData page="1">aabbccdd</pageData>
+  <page number="0">
+    <constant name="testValue">100</constant>
+  </page>
+</msq>"#;
+
+        // Write to temp file
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join("test_page_data.msq");
+        std::fs::write(&temp_path, msq_content).expect("Failed to write temp file");
+
+        // Parse the MSQ
+        let result = TuneFile::load(&temp_path);
+        assert!(result.is_ok(), "Failed to parse MSQ: {:?}", result.err());
+
+        let tune = result.unwrap();
+
+        // Check page 0 data was parsed
+        assert!(tune.pages.contains_key(&0), "Page 0 should be present");
+        let page0 = tune.pages.get(&0).unwrap();
+        assert_eq!(page0.len(), 8, "Page 0 should have 8 bytes");
+        assert_eq!(page0, &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+
+        // Check page 1 data was parsed (lowercase hex)
+        assert!(tune.pages.contains_key(&1), "Page 1 should be present");
+        let page1 = tune.pages.get(&1).unwrap();
+        assert_eq!(page1.len(), 4, "Page 1 should have 4 bytes");
+        assert_eq!(page1, &[0xaa, 0xbb, 0xcc, 0xdd]);
+
+        // Constant should still be parsed
+        let test_value = tune.get_constant("testValue");
+        assert!(test_value.is_some(), "testValue constant not found");
+        match test_value.unwrap() {
+            TuneValue::Scalar(v) => assert_eq!(*v, 100.0),
+            other => panic!("testValue should be Scalar, got: {:?}", other),
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn test_quoted_numeric_bits_values_stay_strings() {
+        // Quoted MSQ values are `bits` option labels, not scalars. Coercing a
+        // numeric-looking label to Scalar makes the bits path treat it as a raw
+        // index: "1" on ["1","2"] would select option 1 ("2") instead of option
+        // 0 ("1"), and "1.0" on ["0.0","0.5","1.0",...] would select "0.5".
+        let msq_content = r#"<?xml version="1.0" encoding="utf-8"?>
+<msq version="1.0">
+  <bibliography author="LibreTune Test" tuneComment="Test tune" writeDate="2026-01-07"/>
+  <versionInfo firmwareInfo="speeduino 202501"/>
+  <page number="0">
+    <constant name="iacChannels">"1"</constant>
+    <constant name="idleAdvDelay">"1.0"</constant>
+    <constant name="algorithm">"Speed Density"</constant>
+    <constant name="reqFuel">12.6</constant>
+    <constant name="flexEnabled">"true"</constant>
+  </page>
+</msq>"#;
+
+        let temp_path = std::env::temp_dir().join("test_quoted_bits.msq");
+        std::fs::write(&temp_path, msq_content).expect("Failed to write temp file");
+
+        let tune = TuneFile::load(&temp_path).expect("Failed to parse MSQ");
+
+        // Numeric-looking labels must remain strings so bit_options resolves them.
+        for (name, expected) in [("iacChannels", "1"), ("idleAdvDelay", "1.0")] {
+            match tune.get_constant(name) {
+                Some(TuneValue::String(s)) => assert_eq!(s.as_str(), expected),
+                other => panic!(
+                    "{} should be String({:?}) so the bits lookup applies, got: {:?}",
+                    name, expected, other
+                ),
+            }
+        }
+
+        // Non-numeric quoted labels keep working.
+        match tune.get_constant("algorithm") {
+            Some(TuneValue::String(s)) => assert_eq!(s.as_str(), "Speed Density"),
+            other => panic!("algorithm should be String, got: {:?}", other),
+        }
+
+        // Unquoted numbers are still scalars.
+        match tune.get_constant("reqFuel") {
+            Some(TuneValue::Scalar(v)) => assert_eq!(*v, 12.6),
+            other => panic!("reqFuel should be Scalar, got: {:?}", other),
+        }
+
+        // Quoted booleans are still booleans.
+        match tune.get_constant("flexEnabled") {
+            Some(TuneValue::Bool(b)) => assert!(*b),
+            other => panic!("flexEnabled should be Bool, got: {:?}", other),
+        }
+
+        // And the labels must survive a save round-trip with their quotes, so
+        // the file stays valid for TunerStudio.
+        let out_path = std::env::temp_dir().join("test_quoted_bits_roundtrip.msq");
+        tune.save(&out_path).expect("Failed to save MSQ");
+        let written = std::fs::read_to_string(&out_path).expect("Failed to read saved MSQ");
+        assert!(
+            written.contains(r#""1.0""#),
+            "idleAdvDelay label lost its quotes on save: {}",
+            written
+        );
+
+        let _ = std::fs::remove_file(&temp_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+}
+
+#[cfg(test)]
+mod msq_metadata_tests {
+    use super::*;
+
+    /// A cut-down file in the shape the reference writer produces.
+    const SAMPLE: &str = r#"<?xml version="1.0" encoding="ISO-8859-1"?>
+<msq xmlns="http://www.msefi.com/:msq">
+<bibliography author="LibreTune" writeDate="Sun May 03 20:46:57 NZST 2026"/>
+<versionInfo fileFormat="5.0" firmwareInfo="Speeduino+2025.01.4" nPages="2" signature="speeduino 202501"/>
+<settings Comment="These setting are only used if this msq is opened without a project.">
+<setting name="CELSIUS"/>
+<setting name="AFR"/>
+</settings>
+<page number="1" size="288">
+<constant cols="1" digits="0" name="wueRates" rows="10" units="%">150 136 131 126 120 115 110 105 100 100</constant>
+<constant digits="1" name="reqFuel" units="ms">12.6</constant>
+</page>
+<page number="-1">
+<pcVariable digits="0" name="rpmhigh" units="rpm">7000</pcVariable>
+</page>
+</msq>
+"#;
+
+    /// Unique per call: these tests run in parallel and fixed names in a shared
+    /// directory make them clobber each other.
+    fn round_trip_at(src: &str, tag: &str) -> (TuneFile, String) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("libretune-msq-meta-{tag}-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inp = dir.join("in.msq");
+        let outp = dir.join("out.msq");
+        std::fs::write(&inp, src).unwrap();
+        let tune = TuneFile::load(&inp).expect("parse");
+        tune.save(&outp).expect("save");
+        let written = std::fs::read_to_string(&outp).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (tune, written)
+    }
+
+    fn round_trip(src: &str) -> (TuneFile, String) {
+        round_trip_at(src, "rt")
+    }
+
+    /// The writer used to emit `<constant name="...">` and nothing else, so a
+    /// saved tune lost every digits/units/rows/cols attribute its source
+    /// carried - 403, 361, 138 and 138 of them respectively on a real file,
+    /// about thirty per cent of its bytes.
+    #[test]
+    fn per_constant_metadata_survives_a_round_trip() {
+        let (tune, written) = round_trip(SAMPLE);
+        assert_eq!(
+            tune.constant_attrs.len(),
+            3,
+            "two constants and one pcVariable"
+        );
+
+        for attr in ["cols=\"1\"", "digits=\"0\"", "rows=\"10\"", "units=\"%\""] {
+            assert!(written.contains(attr), "lost {attr}:\n{written}");
+        }
+        // Alphabetical including the name, matching the reference writer, so the
+        // two files diff cleanly.
+        assert!(written
+            .contains(r#"<constant cols="1" digits="0" name="wueRates" rows="10" units="%">"#));
+        // pcVariables carry them too.
+        assert!(written.contains(r#"<pcVariable digits="0" name="rpmhigh" units="rpm">"#));
+    }
+
+    /// Without <settings> a standalone .msq does not record which #if branch
+    /// its numbers were authored under, and CELSIUS changes scale AND translate
+    /// on roughly thirty temperature constants.
+    #[test]
+    fn the_settings_block_survives_a_round_trip() {
+        let (tune, written) = round_trip(SAMPLE);
+        assert_eq!(tune.ecu_settings, vec!["CELSIUS", "AFR"]);
+        assert!(written.contains("<settings"));
+        assert!(written.contains(r#"<setting name="CELSIUS"/>"#));
+        assert!(written.contains(r#"<setting name="AFR"/>"#));
+    }
+
+    #[test]
+    fn declared_page_sizes_survive_a_round_trip() {
+        let (tune, written) = round_trip(SAMPLE);
+        assert_eq!(tune.page_sizes.get(&1).map(String::as_str), Some("288"));
+        assert!(written.contains(r#"<page number="1" size="288">"#));
+    }
+
+    /// The output must still parse as our own input, with the same values.
+    #[test]
+    fn our_own_output_reads_back_identically() {
+        let (first, written) = round_trip_at(SAMPLE, "first");
+        let (second, _) = round_trip_at(&written, "second");
+        assert_eq!(first.constants.len(), second.constants.len());
+        assert_eq!(first.constant_attrs.len(), second.constant_attrs.len());
+        assert_eq!(first.ecu_settings, second.ecu_settings);
+        assert_eq!(first.page_sizes, second.page_sizes);
+        for (k, v) in &first.constants {
+            assert_eq!(
+                format!("{:?}", second.constants.get(k)),
+                format!("{:?}", Some(v)),
+                "{k} changed"
+            );
+        }
+    }
+
+    /// A file with none of this metadata must still save - the fields are
+    /// preserved when present, not required.
+    #[test]
+    fn a_file_without_metadata_still_saves() {
+        let bare = r#"<?xml version="1.0"?>
+<msq>
+<versionInfo signature="speeduino 202501"/>
+<page number="0">
+<constant name="reqFuel">12.6</constant>
+</page>
+</msq>
+"#;
+        let (tune, written) = round_trip(bare);
+        assert!(
+            tune.constant_attrs.is_empty(),
+            "unexpected attrs: {:?}",
+            tune.constant_attrs
+        );
+        assert!(tune.ecu_settings.is_empty());
+        assert!(written.contains(r#"<constant name="reqFuel">"#));
+        assert!(!written.contains("<settings"));
+    }
+
+    /// An `&`, `<`, `>` or `"` in any emitted value must be XML-escaped, and
+    /// the reader must decode it again, or the saved tune is not well-formed
+    /// XML - TunerStudio refuses it and LibreTune's own `find('>')` tag scan
+    /// walks off the end of the attribute list.
+    #[test]
+    fn msq_escapes_and_decodes_xml_special_characters() {
+        let raw_author = r#"R&D "quoted" <lab>"#;
+        let raw_note = r#"R&D "quoted" <x> 'y'"#;
+
+        let mut tune = TuneFile::new("speeduino 202501");
+        tune.author = Some(raw_author.to_string());
+        tune.set_constant("noteText", TuneValue::String(raw_note.to_string()));
+
+        let dir = std::env::temp_dir().join(format!("lt_xml_escape_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("escaped.msq");
+        tune.save(&path).expect("save");
+        let written = fs::read_to_string(&path).expect("read");
+
+        assert!(
+            written.contains("&amp;") && written.contains("&lt;") && written.contains("&quot;"),
+            "values were not escaped:\n{written}"
+        );
+        assert!(
+            !written.contains("R&D"),
+            "raw ampersand survived into the file:\n{written}"
+        );
+        assert!(
+            !written.contains("<lab>"),
+            "raw angle brackets survived into the file:\n{written}"
+        );
+
+        let reloaded = TuneFile::load(&path).expect("reload");
+        assert_eq!(reloaded.author.as_deref(), Some(raw_author));
+        match reloaded.constants.get("noteText") {
+            Some(TuneValue::String(s)) => assert_eq!(s, raw_note),
+            other => panic!("string constant did not survive the round trip: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `{:.17}` is seventeen *decimal places*, not significant digits, so
+    /// `14.7` (exactly 14.699999999999999289... as an f64) was written as
+    /// `14.69999999999999929`. `f64`'s `Display` already emits the shortest
+    /// decimal that round-trips.
+    #[test]
+    fn msq_scalars_use_the_shortest_round_tripping_form() {
+        let mut tune = TuneFile::new("speeduino 202501");
+        tune.set_constant("stoich", TuneValue::Scalar(14.7));
+        tune.set_constant("reqFuel", TuneValue::Scalar(0.1));
+        tune.set_constant("zero", TuneValue::Scalar(0.0));
+        tune.set_constant("bins", TuneValue::Array(vec![14.7, 1.0, -0.3]));
+        tune.set_pc_variable("pcStoich", TuneValue::Scalar(14.7));
+
+        let dir = std::env::temp_dir().join(format!("lt_msq_fmt_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("fmt.msq");
+        tune.save(&path).expect("save");
+        let written = fs::read_to_string(&path).expect("read");
+
+        assert!(
+            written.contains(">14.7<"),
+            "stoich not shortest:\n{written}"
+        );
+        assert!(
+            written.contains(">0.1<"),
+            "reqFuel not shortest:\n{written}"
+        );
+        assert!(written.contains(">0<"), "zero not shortest:\n{written}");
+        assert!(
+            written.contains(">14.7 1 -0.3<"),
+            "array not shortest:\n{written}"
+        );
+        assert!(
+            written.matches(">14.7<").count() >= 2,
+            "pcVariable not shortest:\n{written}"
+        );
+
+        let reloaded = TuneFile::load(&path).expect("reload");
+        match reloaded.constants.get("stoich") {
+            Some(TuneValue::Scalar(v)) => assert!((v - 14.7).abs() < f64::EPSILON),
+            other => panic!("stoich did not round trip: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

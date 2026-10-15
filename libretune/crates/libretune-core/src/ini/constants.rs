@@ -1,0 +1,781 @@
+//! Constants section parser
+//!
+//! Parses the [Constants] section which defines editable ECU parameters.
+
+use super::split_ini_line;
+use super::types::{DataType, DynamicSizeRefs, Endianness, Shape};
+use serde::{Deserialize, Serialize};
+
+/// A constant/parameter definition from the INI file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Constant {
+    /// Constant name/identifier
+    pub name: String,
+
+    /// Human-readable label
+    pub label: Option<String>,
+
+    /// ECU page number (0-indexed)
+    pub page: u8,
+
+    /// Byte offset within page
+    pub offset: u16,
+
+    /// Data type
+    pub data_type: DataType,
+
+    /// Per-field endianness override (from BU08, BS16, etc. types)
+    /// If None, use global ECU endianness
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endianness_override: Option<Endianness>,
+
+    /// Shape (scalar, 1D, 2D)
+    pub shape: Shape,
+
+    /// For bits type: starting bit index from INI `[start:end]`
+    pub bit_position: Option<u8>,
+
+    /// For bits type: bit count (`end - start + 1` from INI `[start:end]`)
+    pub bit_size: Option<u8>,
+
+    /// For bits type: display offset (e.g., +1 means raw 0 displays as 1)
+    /// Used in notations like [4:7+1] where the +1 is added to displayed value
+    pub display_offset: i8,
+
+    /// Unit of measurement
+    pub units: String,
+
+    /// Scale factor (multiply raw by this)
+    pub scale: f64,
+
+    /// Translation offset (add this after scaling)
+    pub translate: f64,
+
+    /// Minimum allowed value (display units)
+    pub min: f64,
+
+    /// Maximum allowed value (display units)
+    pub max: f64,
+
+    /// Number of decimal digits for display
+    pub digits: u8,
+
+    /// Tooltip/help text
+    pub help: Option<String>,
+
+    /// Condition expression for visibility
+    pub visibility_condition: Option<String>,
+
+    /// For bits type: option labels (e.g., ["Off", "On"])
+    pub bit_options: Vec<String>,
+
+    /// Whether this is a PC variable (stored locally, not on ECU)
+    pub is_pc_variable: bool,
+
+    /// Present when the INI sizes this array with `{const}` refs (resizable tables).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_size: Option<DynamicSizeRefs>,
+
+    /// Raw INI text of the scale field when it is an expression rather than a
+    /// literal, e.g. Speeduino's `{fuelLoadRes}` (which resolves to 2.0 or 0.5
+    /// depending on the `algorithm` constant). Such a field cannot be resolved
+    /// at parse time because it depends on tune values, so the expression is
+    /// kept here and applied by [`resolve_dynamic_scale`] once those are known.
+    /// Without it the field silently fell back to 1.0 and every affected axis
+    /// displayed raw storage units (a Speeduino load axis read 8-50 instead of
+    /// 16-100 kPa).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_expr: Option<String>,
+
+    /// Same as [`Constant::scale_expr`], for the translate field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translate_expr: Option<String>,
+    /// Same as [`Constant::scale_expr`], for the min field.
+    pub min_expr: Option<String>,
+    /// Same as [`Constant::scale_expr`], for the max field.
+    pub max_expr: Option<String>,
+    /// Are [`Constant::min`] and [`Constant::max`] the range the INI declares?
+    ///
+    /// False while a `{expression}` bound is unresolved, because the numeric
+    /// fallback is then the raw-byte span rather than the real range.
+    /// `advTable2` declares `{ ign2ValuesMin }` / `{ ign2ValuesMax }` and would
+    /// otherwise fall back to 0..255 - which on a table with `translate = -40`
+    /// refuses every retard value while still waving through an advance far
+    /// past the real maximum. Not clamping is better than clamping to a lie.
+    pub range_resolved: bool,
+}
+
+/// Extract a deferred expression from an INI numeric field.
+///
+/// Returns `Some(expr)` when the field is a `{...}` expression that cannot be
+/// parsed as a literal, and `None` when it is a plain number (or empty).
+pub fn deferred_expr(field: &str) -> Option<String> {
+    let t = field.trim();
+    if t.parse::<f64>().is_ok() {
+        return None;
+    }
+    let inner = t.strip_prefix('{')?.strip_suffix('}')?.trim();
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
+impl Constant {
+    /// Create a new scalar constant with defaults
+    pub fn new(name: impl Into<String>, page: u8, offset: u16, data_type: DataType) -> Self {
+        Self {
+            name: name.into(),
+            label: None,
+            page,
+            offset,
+            data_type,
+            endianness_override: None,
+            shape: Shape::Scalar,
+            bit_position: None,
+            bit_size: None,
+            display_offset: 0,
+            units: String::new(),
+            scale: 1.0,
+            translate: 0.0,
+            min: 0.0,
+            max: 255.0,
+            digits: 0,
+            help: None,
+            visibility_condition: None,
+            bit_options: Vec::new(),
+            is_pc_variable: false,
+            dynamic_size: None,
+            scale_expr: None,
+            translate_expr: None,
+            min_expr: None,
+            max_expr: None,
+            range_resolved: true,
+        }
+    }
+
+    /// Total size in bytes for this constant
+    pub fn size_bytes(&self) -> usize {
+        if self.data_type == DataType::Bits {
+            // Bits don't take extra space, they're packed
+            0
+        } else if self.data_type == DataType::String {
+            // Strings have their length stored in shape (1 byte per character)
+            self.shape.element_count()
+        } else {
+            self.data_type.size_bytes() * self.shape.element_count()
+        }
+    }
+
+    /// Convert a raw value to display value
+    pub fn raw_to_display(&self, raw: f64) -> f64 {
+        raw * self.scale + self.translate
+    }
+
+    /// Convert a display value to raw value
+    /// Convert a display value to raw storage, clamped to the declared range.
+    ///
+    /// The clamp lives here because this is the one funnel every write path
+    /// already passes through - tables, curves, scalars and bit fields alike.
+    /// Without it `advTable1`, declared `min -40, max 70`, accepted 200 degrees
+    /// of ignition advance: `(200 - -40) / 1.0` is 240, a perfectly legal U08,
+    /// so nothing downstream had cause to object. Confirmed on a bench ECU -
+    /// written and read back as 200 degrees. The only ceiling was the byte
+    /// itself, at 215.
+    ///
+    /// Skipped when the range is not trustworthy; see
+    /// [`Constant::range_resolved`].
+    pub fn display_to_raw(&self, display: f64) -> f64 {
+        let value = if self.range_resolved {
+            // Ordered rather than trusted: f64::clamp panics when lo > hi and a
+            // hand-edited INI can declare them either way round.
+            let lo = self.min.min(self.max);
+            let hi = self.min.max(self.max);
+            display.clamp(lo, hi)
+        } else {
+            display
+        };
+        (value - self.translate) / self.scale
+    }
+
+    /// Check if a display value is within allowed range
+    pub fn is_in_range(&self, display_value: f64) -> bool {
+        display_value >= self.min && display_value <= self.max
+    }
+}
+
+impl Default for Constant {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            label: None,
+            page: 0,
+            offset: 0,
+            data_type: DataType::U08,
+            endianness_override: None,
+            shape: Shape::Scalar,
+            bit_position: None,
+            bit_size: None,
+            display_offset: 0,
+            units: String::new(),
+            scale: 1.0,
+            translate: 0.0,
+            min: 0.0,
+            max: 255.0,
+            digits: 0,
+            help: None,
+            visibility_condition: None,
+            bit_options: Vec::new(),
+            is_pc_variable: false,
+            dynamic_size: None,
+            scale_expr: None,
+            translate_expr: None,
+            min_expr: None,
+            max_expr: None,
+            range_resolved: true,
+        }
+    }
+}
+
+/// Parse a constant definition line from INI
+///
+/// Format: name = class, type, offset, shape, units, scale, translate, min, max, digits
+/// Note: Uses split_ini_line to properly handle expressions with commas inside braces,
+/// such as: { bitStringValue(algorithmUnits , algorithm) }
+/// The last_offset parameter supports the "lastOffset" keyword which means "use running offset counter"
+/// Supports per-field big-endian types (BU08, BS16, etc.) that override global endianness.
+/// The help parameter is the extracted help text from the field name (if any).
+pub fn parse_constant_line(
+    name: &str,
+    value: &str,
+    page: u8,
+    last_offset: u16,
+    help: Option<String>,
+) -> Option<Constant> {
+    let parts_vec = split_ini_line(value);
+    let parts: Vec<&str> = parts_vec.iter().map(|s| s.as_str()).collect();
+
+    if parts.len() < 3 {
+        return None;
+    }
+
+    // parts[0] = class (scalar, array, bits)
+    // parts[1] = type (U08, S16, BU16, etc. - B* types force big-endian)
+    // parts[2] = offset (can be numeric or "lastOffset" keyword)
+
+    let class = parts[0].to_lowercase();
+    let (data_type, endianness_override) = DataType::from_ini_str_with_endianness(parts[1])?;
+
+    // Handle "lastOffset" keyword - use the running offset counter
+    let offset: u16 = if parts[2].trim().to_lowercase() == "lastoffset" {
+        last_offset
+    } else {
+        parts[2].parse().ok()?
+    };
+
+    let mut constant = Constant::new(name, page, offset, data_type);
+    constant.endianness_override = endianness_override;
+    constant.help = help;
+
+    // Parse shape based on class and remaining parts
+    if class == "bits" {
+        constant.data_type = DataType::Bits;
+        // Format: bits, U08, offset, [start:end+display_offset], "Option1", ...
+        // TunerStudio bit ranges are inclusive start:end (not position:size).
+        // Examples: [6:6] → 1 bit at 6; [0:3] → 4 bits; [4:7+1] → 4 bits, display+1
+        if parts.len() > 3 {
+            if let Some((start, size, display_offset)) = parse_bit_range_spec(parts[3]) {
+                constant.bit_position = Some(start);
+                constant.bit_size = Some(size);
+                constant.display_offset = display_offset;
+            }
+        }
+        // Collect bit options (everything after the bit spec)
+        // These are the labels for each possible value (e.g., "Off", "On")
+        for part in parts.iter().skip(4) {
+            let opt = part.trim().trim_matches('"').to_string();
+            if !opt.is_empty() && !opt.starts_with('{') {
+                // Skip empty options and visibility conditions
+                constant.bit_options.push(opt);
+            }
+        }
+        return Some(constant);
+    } else if class == "array" && parts.len() > 3 {
+        let (shape, dyn_refs) = Shape::parse_with_dynamic(parts[3]);
+        constant.shape = shape;
+        constant.dynamic_size = dyn_refs;
+    } else if class == "string" && parts.len() > 3 {
+        // String constants: name = string, ASCII, offset, length
+        // The 4th field is the length in bytes
+        if let Ok(length) = parts[3].trim().parse::<usize>() {
+            constant.shape = Shape::Array1D(length);
+        }
+    }
+
+    // Parse units (index 4 for bits/array, 3 for scalar)
+    let units_idx = if class == "bits" || class == "array" {
+        4
+    } else {
+        3
+    };
+    if parts.len() > units_idx {
+        constant.units = parts[units_idx].trim_matches('"').to_string();
+    }
+
+    apply_scale_and_range(&mut constant, &parts, units_idx + 1);
+
+    Some(constant)
+}
+
+/// Read the trailing `scale, translate, min, max, digits` columns into
+/// `constant`, starting at `scale_idx`.
+///
+/// Any of scale/translate/min/max may be a `{expr}` reference to another
+/// constant (Speeduino's `{fuelLoadRes}`); those are recorded for deferred
+/// resolution instead of silently collapsing to the literal fallback, and a
+/// deferred min/max clears `range_resolved` so `display_to_raw` does not clamp
+/// against a range the INI never declared. Shared by `[Constants]` and
+/// `[PcVariables]`, which used to disagree: the PcVariable path parsed the same
+/// columns without any of the deferral, fabricating a 0..255 range.
+fn apply_scale_and_range(constant: &mut Constant, parts: &[&str], scale_idx: usize) {
+    if parts.len() > scale_idx {
+        constant.scale_expr = deferred_expr(parts[scale_idx]);
+        constant.scale = parts[scale_idx].parse().unwrap_or(1.0);
+    }
+    if parts.len() > scale_idx + 1 {
+        constant.translate_expr = deferred_expr(parts[scale_idx + 1]);
+        constant.translate = parts[scale_idx + 1].parse().unwrap_or(0.0);
+    }
+    if parts.len() > scale_idx + 2 {
+        constant.min_expr = deferred_expr(parts[scale_idx + 2]);
+        constant.min = parts[scale_idx + 2].parse().unwrap_or(0.0);
+    }
+    if parts.len() > scale_idx + 3 {
+        constant.max_expr = deferred_expr(parts[scale_idx + 3]);
+        constant.max = parts[scale_idx + 3].parse().unwrap_or(255.0);
+    }
+    constant.range_resolved = constant.min_expr.is_none() && constant.max_expr.is_none();
+    if parts.len() > scale_idx + 4 {
+        constant.digits = parts[scale_idx + 4].parse().unwrap_or(0);
+    }
+}
+
+/// Parse a PcVariable constant line (no offset field)
+/// Format: name = class, type, units, scale, translate, min, max, digits
+/// or: name = bits, U08, [bit_spec], "Option1", "Option2", ...
+/// PcVariables are stored locally (not on ECU), so they use page 255 and offset 0
+/// The help parameter is the extracted help text from the field name (if any).
+pub fn parse_pc_variable_line(name: &str, value: &str, help: Option<String>) -> Option<Constant> {
+    let parts_vec = split_ini_line(value);
+    let parts: Vec<&str> = parts_vec.iter().map(|s| s.as_str()).collect();
+
+    if parts.len() < 2 {
+        return None;
+    }
+
+    // parts[0] = class (scalar, array, bits)
+    // parts[1] = type (U08, S16, etc)
+    // NO offset for PcVariables
+
+    let class = parts[0].to_lowercase();
+    let data_type = DataType::from_ini_str(parts[1])?;
+
+    // Use page 255 to indicate PC variable (not stored on ECU)
+    let mut constant = Constant::new(name, 255, 0, data_type);
+    constant.is_pc_variable = true;
+    constant.help = help;
+
+    // Parse based on class
+    if class == "bits" {
+        constant.data_type = DataType::Bits;
+        // Format: bits, U08, [start:end+display_offset], "Option1", ...
+        if parts.len() > 2 {
+            if let Some((start, size, display_offset)) = parse_bit_range_spec(parts[2]) {
+                constant.bit_position = Some(start);
+                constant.bit_size = Some(size);
+                constant.display_offset = display_offset;
+            }
+        }
+        // Collect bit options
+        for part in parts.iter().skip(3) {
+            let opt = part.trim().trim_matches('"').to_string();
+            if !opt.is_empty() && !opt.starts_with('{') {
+                constant.bit_options.push(opt);
+            }
+        }
+        return Some(constant);
+    } else if class == "array" && parts.len() > 2 {
+        // Format: array, type, [shape], units, scale, ...
+        let (shape, dyn_refs) = Shape::parse_with_dynamic(parts[2]);
+        constant.shape = shape;
+        constant.dynamic_size = dyn_refs;
+        // Parse units starting at index 3
+        if parts.len() > 3 {
+            constant.units = parts[3].trim_matches('"').to_string();
+        }
+        apply_scale_and_range(&mut constant, &parts, 4);
+        return Some(constant);
+    }
+
+    // Scalar format: scalar, type, units, scale, translate, min, max, digits
+    if parts.len() > 2 {
+        constant.units = parts[2].trim_matches('"').to_string();
+    }
+    apply_scale_and_range(&mut constant, &parts, 3);
+
+    Some(constant)
+}
+
+/// Widest bit index a TunerStudio bit field may name: bit fields are backed by
+/// at most a 32-bit storage type, so `[0:31]` is the largest legal range.
+const MAX_BIT_INDEX: u8 = 32;
+
+/// Parse TunerStudio bit range `[start:end]` or `[start:end+N]` / `[start:end-N]`.
+/// Returns `(start_bit, bit_count, display_offset)` where `bit_count = end - start + 1`.
+fn parse_bit_range_spec(spec: &str) -> Option<(u8, u8, i8)> {
+    let bit_spec = spec.trim().trim_matches(|c| c == '[' || c == ']');
+    let bit_parts: Vec<&str> = bit_spec.split(':').collect();
+    if bit_parts.is_empty() {
+        return None;
+    }
+    let start: u8 = bit_parts[0].parse().ok()?;
+    if bit_parts.len() < 2 {
+        return Some((start, 1, 0));
+    }
+
+    let end_part = bit_parts[1];
+    let (end, display_offset) = if let Some(plus_pos) = end_part.find('+') {
+        let end: u8 = end_part[..plus_pos].parse().ok()?;
+        let offset = end_part[plus_pos + 1..].parse().unwrap_or(0);
+        (end, offset)
+    } else if let Some(minus_pos) = end_part.rfind('-') {
+        // rfind avoids treating a leading '-' on a negative index as an offset
+        if minus_pos > 0 {
+            let end: u8 = end_part[..minus_pos].parse().ok()?;
+            let offset = -(end_part[minus_pos + 1..].parse::<i8>().unwrap_or(0));
+            (end, offset)
+        } else {
+            (end_part.parse().ok()?, 0)
+        }
+    } else {
+        (end_part.parse().ok()?, 0)
+    };
+
+    // `end - start + 1` on `u8` overflows for a range like `[0:255]`: a panic
+    // under the default debug `overflow-checks`, a silent `bit_size = 0` in
+    // release. Both bounds also have to fit the widest storage type a bit
+    // field may use, which is 32 bits.
+    if start >= MAX_BIT_INDEX || end >= MAX_BIT_INDEX {
+        return None;
+    }
+    let size = if end >= start {
+        (end - start).checked_add(1)?
+    } else {
+        1
+    };
+    Some((start, size, display_offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_new() {
+        let c = Constant::new("test", 0, 100, DataType::U16);
+        assert_eq!(c.name, "test");
+        assert_eq!(c.offset, 100);
+        assert_eq!(c.data_type, DataType::U16);
+    }
+
+    #[test]
+    fn test_raw_display_conversion() {
+        let mut c = Constant::new("afr", 0, 0, DataType::U08);
+        c.scale = 0.1;
+        c.translate = 0.0;
+
+        assert!((c.raw_to_display(147.0) - 14.7).abs() < 0.01);
+        assert!((c.display_to_raw(14.7) - 147.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_constant_line_scalar() {
+        let c = parse_constant_line(
+            "reqFuel",
+            "scalar, U16, 0, \"ms\", 0.1, 0.0, 0, 25.5, 1",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.name, "reqFuel");
+        assert_eq!(c.data_type, DataType::U16);
+        assert_eq!(c.offset, 0);
+        assert!((c.scale - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_array_constant_preserves_digits() {
+        // Issue #331 reproducer: IAT volts need 0.001 resolution, digits = 3.
+        let c = parse_constant_line(
+            "IAT_X_Voltage",
+            "array, U16, 19, [16], \"V\", 0.001, 0, 0, 5.000, 3",
+            2,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.digits, 3);
+        assert!((c.scale - 0.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_constant_line_lastoffset() {
+        // Test the lastOffset keyword - should use the provided last_offset value
+        let c = parse_constant_line(
+            "afrTable",
+            "array, U08, lastOffset, [16x16], \"AFR\", 0.1, 0.0, 7, 25.5, 1",
+            0,
+            1234,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.name, "afrTable");
+        assert_eq!(c.data_type, DataType::U08);
+        assert_eq!(c.offset, 1234); // Should use the last_offset value
+        assert_eq!(c.shape, Shape::Array2D { rows: 16, cols: 16 });
+    }
+
+    #[test]
+    fn test_parse_pc_variable_line_scalar() {
+        // Test PC variable scalar parsing (no offset)
+        let c = parse_pc_variable_line("rpmwarn", "scalar, U16, \"rpm\", 1, 0, 0, 30000, 0", None);
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.name, "rpmwarn");
+        assert_eq!(c.data_type, DataType::U16);
+        assert_eq!(c.page, 255); // PC variable marker
+        assert_eq!(c.offset, 0);
+        assert!(c.is_pc_variable);
+        assert_eq!(c.units, "rpm");
+        assert!((c.max - 30000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_pc_variable_line_bits() {
+        // Test PC variable bits parsing
+        let c = parse_pc_variable_line(
+            "tsCanId",
+            "bits, U08, [0:3], \"CAN ID 0\", \"CAN ID 1\", \"CAN ID 2\"",
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.name, "tsCanId");
+        assert_eq!(c.data_type, DataType::Bits);
+        assert!(c.is_pc_variable);
+        assert_eq!(c.bit_position, Some(0));
+        assert_eq!(c.bit_size, Some(4)); // [0:3] inclusive → 4 bits
+        assert_eq!(c.bit_options.len(), 3);
+        assert_eq!(c.bit_options[0], "CAN ID 0");
+        assert_eq!(c.display_offset, 0); // No offset
+    }
+
+    #[test]
+    fn test_parse_bits_single_bit() {
+        // consumeObdSensors-style flag: [6:6] is one bit at position 6
+        let c = parse_constant_line(
+            "consumeObdSensors",
+            "bits, U08, 10, [6:6], \"false\", \"true\"",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.bit_position, Some(6));
+        assert_eq!(c.bit_size, Some(1));
+    }
+
+    #[test]
+    fn test_parse_bits_with_display_offset_positive() {
+        // Test [4:7+1] notation - bits 4..=7 with display offset of +1
+        let c = parse_constant_line("nCylinders", "bits, U08, 182, [4:7+1]", 0, 0, None);
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.name, "nCylinders");
+        assert_eq!(c.data_type, DataType::Bits);
+        assert_eq!(c.bit_position, Some(4));
+        assert_eq!(c.bit_size, Some(4)); // [4:7] inclusive → 4 bits
+        assert_eq!(c.display_offset, 1); // +1 display offset
+    }
+
+    #[test]
+    fn test_parse_bits_with_display_offset_negative() {
+        // Test [0:3-1] notation - bits 0..=3 with display offset of -1
+        let c = parse_constant_line(
+            "someField",
+            "bits, U08, 100, [0:3-1], \"Val 0\", \"Val 1\"",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.name, "someField");
+        assert_eq!(c.bit_position, Some(0));
+        assert_eq!(c.bit_size, Some(4)); // [0:3] inclusive → 4 bits
+        assert_eq!(c.display_offset, -1); // -1 display offset
+        assert_eq!(c.bit_options.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_bits_without_display_offset() {
+        // Test [0:7] notation - full byte, no display offset
+        let c = parse_constant_line(
+            "normalBits",
+            "bits, U08, 50, [0:7], \"Off\", \"On\"",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.bit_position, Some(0));
+        assert_eq!(c.bit_size, Some(8)); // [0:7] inclusive → 8 bits
+        assert_eq!(c.display_offset, 0); // No offset
+    }
+
+    #[test]
+    fn test_parse_bits_with_invalid_options() {
+        // Test that INVALID options are still collected (filtering happens in frontend)
+        let c = parse_constant_line(
+            "strategy",
+            "bits, U08, 10, [2:3], \"Basic\", \"INVALID\", \"INVALID\", \"Advanced\"",
+            0,
+            0,
+            None,
+        );
+        assert!(c.is_some());
+        let c = c.unwrap();
+        assert_eq!(c.bit_options.len(), 4);
+        assert_eq!(c.bit_options[0], "Basic");
+        assert_eq!(c.bit_options[1], "INVALID");
+        assert_eq!(c.bit_options[2], "INVALID");
+        assert_eq!(c.bit_options[3], "Advanced");
+    }
+}
+
+#[cfg(test)]
+mod declared_range_tests {
+    use super::*;
+
+    fn spark_table() -> Constant {
+        // advTable1 = array, U08, 0,[16x16], "deg", 1.0, -40, -40, 70.0, 0
+        let mut c = Constant::new("advTable1", 2, 0, DataType::U08);
+        c.scale = 1.0;
+        c.translate = -40.0;
+        c.min = -40.0;
+        c.max = 70.0;
+        c.range_resolved = true;
+        c
+    }
+
+    /// Confirmed on a bench Speeduino before this clamp existed: 90 and 200
+    /// degrees of advance were both written and read back intact, because
+    /// (200 - -40) / 1.0 is 240 and a U08 holds that happily.
+    #[test]
+    fn an_out_of_range_value_cannot_reach_the_ecu() {
+        let c = spark_table();
+        assert_eq!(c.display_to_raw(200.0), c.display_to_raw(70.0));
+        assert_eq!(c.display_to_raw(90.0), c.display_to_raw(70.0));
+        assert_eq!(c.display_to_raw(-500.0), c.display_to_raw(-40.0));
+        // The declared edges themselves must still pass through untouched.
+        assert_eq!(c.display_to_raw(70.0), 110.0);
+        assert_eq!(c.display_to_raw(-40.0), 0.0);
+        assert_eq!(c.display_to_raw(20.0), 60.0);
+    }
+
+    /// `advTable2` declares `{ ign2ValuesMin }` / `{ ign2ValuesMax }`. Until
+    /// those resolve, min/max hold the raw-byte fallback of 0..255 - clamping
+    /// to that would refuse every retard value on a table whose real minimum is
+    /// -40, while still allowing an advance well past the real maximum.
+    #[test]
+    fn an_unresolved_expression_range_does_not_clamp() {
+        let mut c = spark_table();
+        c.min_expr = Some("ign2ValuesMin".into());
+        c.max_expr = Some("ign2ValuesMax".into());
+        c.min = 0.0;
+        c.max = 255.0;
+        c.range_resolved = false;
+
+        // -20 degrees of retard survives rather than being clamped up to 0.
+        assert_eq!(c.display_to_raw(-20.0), 20.0);
+    }
+
+    /// A hand-edited INI can declare the bounds either way round, and
+    /// f64::clamp panics when lo > hi.
+    #[test]
+    fn a_reversed_range_is_ordered_not_trusted() {
+        let mut c = spark_table();
+        c.min = 70.0;
+        c.max = -40.0;
+        assert_eq!(c.display_to_raw(200.0), c.display_to_raw(70.0));
+        assert_eq!(c.display_to_raw(-500.0), c.display_to_raw(-40.0));
+    }
+
+    /// `[PcVariables]` scalars go through the same `{expr}` deferral as
+    /// `[Constants]` ones. Without it a `{maxRpm}` min/max collapsed to the
+    /// literal 0.0/255.0 fallback and `display_to_raw` clamped against a range
+    /// the INI never declared.
+    #[test]
+    fn pc_variable_scalars_defer_brace_expressions_like_constants_do() {
+        let c = parse_pc_variable_line(
+            "rpmwarn",
+            "scalar, U16, \"RPM\", {rpmScale}, {rpmOffset}, {rpmMin}, {rpmMax}, 0",
+            None,
+        )
+        .expect("parses");
+
+        assert_eq!(c.scale_expr.as_deref(), Some("rpmScale"));
+        assert_eq!(c.translate_expr.as_deref(), Some("rpmOffset"));
+        assert_eq!(c.min_expr.as_deref(), Some("rpmMin"));
+        assert_eq!(c.max_expr.as_deref(), Some("rpmMax"));
+        assert!(
+            !c.range_resolved,
+            "a deferred min/max must not be treated as resolved"
+        );
+    }
+
+    /// Literal min/max still resolve immediately.
+    #[test]
+    fn pc_variable_scalars_with_literal_ranges_stay_resolved() {
+        let c = parse_pc_variable_line("rpmwarn", "scalar, U16, \"RPM\", 1, 0, 100, 9000, 0", None)
+            .expect("parses");
+
+        assert!(c.range_resolved);
+        assert!((c.min - 100.0).abs() < f64::EPSILON);
+        assert!((c.max - 9000.0).abs() < f64::EPSILON);
+    }
+
+    /// `end - start + 1` on `u8` overflows for `[0:255]`: a panic under the
+    /// default debug `overflow-checks`, a silent `bit_size = 0` in release.
+    /// The spec caps a bit field at the 32 bits of its storage type.
+    #[test]
+    fn wide_bit_ranges_are_rejected_instead_of_overflowing() {
+        let c = parse_constant_line("wide", "bits, U08, 0, [0:255], \"a\", \"b\"", 0, 0, None)
+            .expect("parses");
+        assert_eq!(c.bit_size, None, "an impossible bit range must be rejected");
+        assert_eq!(c.bit_position, None);
+
+        let pc =
+            parse_pc_variable_line("widePc", "bits, U08, [0:255], \"a\"", None).expect("parses");
+        assert_eq!(pc.bit_size, None);
+
+        // A legal range is unaffected.
+        let ok = parse_constant_line("narrow", "bits, U08, 0, [4:7], \"a\"", 0, 0, None)
+            .expect("parses");
+        assert_eq!(ok.bit_position, Some(4));
+        assert_eq!(ok.bit_size, Some(4));
+    }
+}

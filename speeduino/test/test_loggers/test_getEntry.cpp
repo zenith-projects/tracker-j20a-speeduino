@@ -8,7 +8,7 @@
 static constexpr uint8_t expected_2byte_keys[] = {
   4, 14, 17, 22, 26, 28, 33, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62,
   64, 66, 68, 70, 72, 76, 78, 80, 82, 86, 88, 90, 93, 95, 99, 104, 111,
-  121, 125, 130, 132, 134, 136
+  121, 125, 130, 132, 134, 136, 139, 141
 };
 
 static bool isInExpected(uint8_t key)
@@ -47,12 +47,13 @@ static void test_is2ByteEntry_edges(void)
   // First entry in the table
   TEST_ASSERT_TRUE(is2ByteEntry(4U));
   // Last entry in the table
-  TEST_ASSERT_TRUE(is2ByteEntry(136U));
+  TEST_ASSERT_TRUE(is2ByteEntry(141U));
   // Just below the lowest entry
   TEST_ASSERT_FALSE(is2ByteEntry(0U));
   TEST_ASSERT_FALSE(is2ByteEntry(3U));
-  // Just above the highest entry
+  // Gaps and just above the highest entry
   TEST_ASSERT_FALSE(is2ByteEntry(137U));
+  TEST_ASSERT_FALSE(is2ByteEntry(142U));
   TEST_ASSERT_FALSE(is2ByteEntry(200U));
 }
 
