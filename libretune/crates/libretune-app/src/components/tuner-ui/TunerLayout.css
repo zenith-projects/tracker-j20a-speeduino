@@ -1,0 +1,65 @@
+/*
+ * TunerLayout - Main application shell
+ * Mimics TS MS layout with menubar, toolbar, tabs, sidebar, status bar
+ */
+
+.tuner-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  background: var(--bg-app);
+}
+
+/* Main content area (sidebar + documents) */
+.tuner-layout-main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  /* Lets the AI assistant panel auto-hide by available width below,
+     mirroring the container-query pattern already used for dialog panels
+     (DialogRenderer.css's .dialog-column). */
+  container-type: inline-size;
+}
+
+/* The AI assistant side panel is optional and already user-toggleable
+   (agentPanelVisible) — auto-hide it first when the window gets tight
+   rather than letting its own 260px min-width floor squeeze the sidebar
+   and document area into something unusable. It reappears on its own once
+   there's room again; the underlying agentPanelVisible state is untouched,
+   so this never fights the user's manual toggle. */
+@container (max-width: 900px) {
+  .agent-panel {
+    display: none;
+  }
+}
+
+/* Document area (tabs + content) */
+.tuner-layout-documents {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Content area below tabs */
+.tuner-layout-content {
+  flex: 1;
+  overflow: auto;
+  background: var(--bg-surface);
+  position: relative;
+}
+
+/* When no tabs are open, show welcome message */
+.tuner-layout-content:empty::before {
+  content: 'Open a table, dialog, or dashboard from the sidebar';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: var(--text-muted);
+  font-size: var(--font-size-lg);
+}

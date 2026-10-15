@@ -1,0 +1,29 @@
+name: Setup Rust
+description: Install Rust toolchain and enable Swatinem rust-cache (no target/ blob cache)
+
+inputs:
+  components:
+    description: Comma-separated rustup components
+    required: false
+    default: ""
+  cache_key:
+    description: Extra rust-cache key suffix
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      with:
+        toolchain: stable
+        components: ${{ inputs.components }}
+
+    - name: Cache Rust build
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        shared-key: ${{ inputs.cache_key }}
+        cache-targets: "true"
+        # Key includes Cargo.lock + workspace fingerprint; safe incremental reuse
+        # within the same lockfile revision (unlike hashing target/ on lock alone).

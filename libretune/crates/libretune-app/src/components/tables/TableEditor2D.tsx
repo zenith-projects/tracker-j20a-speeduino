@@ -1,0 +1,1688 @@
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { open, save } from '@tauri-apps/plugin-dialog';
+import { emit } from '@tauri-apps/api/event';
+import { ArrowLeft, Save, Zap, ExternalLink, AlertTriangle, Palette, MapPin, Crosshair, Box, Scaling, ArrowUpDown } from 'lucide-react';
+import TableToolbar from './TableToolbar';
+import TableGrid, { SelectionRange } from './TableGrid';
+import TableEditor3D from './TableEditor3D';
+import TableContextMenu from './TableContextMenu';
+import RebinDialog from '../dialogs/RebinDialog';
+import SetTableSizeDialog from '../dialogs/SetTableSizeDialog';
+import CellEditDialog from '../dialogs/CellEditDialog';
+import GenerateTableDialog from '../dialogs/GenerateTableDialog';
+import TableAdjustDialog from './TableAdjustDialog';
+import { classifyGeneratableTable, generatableTableLabel } from '../../utils/tableGenerator';
+import {
+  parseTableAdjustInput,
+  tableAdjustResultError,
+  tableAdjustTransform,
+  type TableAdjustKind,
+} from '../../utils/tableAdjustInput';
+import type { BackendTableData, TableSizeInfo } from '../../types/app';
+import LambdaPreviewTable from './LambdaPreviewTable';
+import { useHeatmapSettings } from '../../utils/useHeatmapSettings';
+import { useTableYAxisBottom, setTableYAxisBottom, useTrailFadeSec } from '../../utils/useTableOrientation';
+import { useChannels } from '../../stores/realtimeStore';
+import { useToast } from '../../contexts/ToastContext';
+import { getHotkeyManager } from '../../services/hotkeyService';
+import './TableComponents.css';
+import './TableEditor2D.css';
+import TableLiveReadout from './TableLiveReadout';
+import { hasEmbeddedTableLiveReadout, resolveEmbeddedTableOutputChannel } from './tableLiveChannels';
+import { useDialogValueSource } from '../dialogs/DialogValueSource';
+
+type TableOperationResult = {
+  table_name: string;
+  x_bins: number[];
+  y_bins: number[];
+  z_values: number[][];
+};
+
+/** Stable empty-array reference so TableGrid's memo doesn't see a "new" prop
+ * every render just because the trail is hidden. */
+const EMPTY_HISTORY_TRAIL: [number, number][] = [];
+
+/**
+ * Props for the TableEditor2D component.
+ */
+interface TableEditor2DProps {
+  /** Display title for the table */
+  title: string;
+  /** Internal name used for backend operations */
+  table_name: string;
+  /** Label for the X axis (columns) */
+  x_axis_name: string;
+  /** Label for the Y axis (rows) */
+  y_axis_name: string;
+  /** X axis bin values (column headers) */
+  x_bins: number[];
+  /** Y axis bin values (row headers) */
+  y_bins: number[];
+  /** 2D array of Z values [row][col] */
+  z_values: number[][];
+  /** Output channel name for X-axis (used for live cursor) */
+  x_output_channel?: string | null;
+  /** Output channel name for Y-axis (used for live cursor) */
+  y_output_channel?: string | null;
+  /** Callback when back button is clicked (optional for embedded mode) */
+  onBack?: () => void;
+  /** Compact mode for embedding in dialogs */
+  embedded?: boolean;
+  /** Callback to open this table in a separate tab */
+  onOpenInTab?: () => void;
+  /** Callback when cell values are modified */
+  onValuesChange?: (values: number[][]) => void;
+}
+
+/**
+ * State for the re-bin dialog.
+ */
+interface RebinDialogState {
+  show: boolean;
+  newXBins: number[];
+  newYBins: number[];
+}
+
+/**
+ * State for the cell edit dialog.
+ */
+interface CellEditDialogState {
+  show: boolean;
+  row: number;
+  col: number;
+  value: number;
+}
+
+/**
+ * TableEditor2D - A comprehensive 2D table editor for ECU calibration data.
+ * 
+ * Features:
+ * - Cell selection (click, shift-click, ctrl-click, drag)
+ * - Value editing (direct input, increment/decrement)
+ * - Bulk operations (set equal, scale, smooth, interpolate)
+ * - Copy/paste with smart selection
+ * - Undo/redo support
+ * - Color-coded cell values with heatmap visualization
+ * - Live cursor showing current ECU operating point
+ * - History trail showing recent operating positions
+ * - Re-binning with automatic Z-value interpolation
+ * - Context menu for additional operations
+ * 
+ * @example
+ * ```tsx
+ * <TableEditor2D
+ *   title="VE Table 1"
+ *   table_name="veTable1Tbl"
+ *   x_axis_name="RPM"
+ *   y_axis_name="MAP"
+ *   x_bins={[500, 1000, 1500, ...]}
+ *   y_bins={[20, 40, 60, ...]}
+ *   z_values={[[50, 52, ...], ...]}
+ *   onBack={() => closeTab()}
+ * />
+ * ```
+ */
+export default function TableEditor2D({
+  title,
+  table_name,
+  x_axis_name,
+  y_axis_name,
+  x_bins,
+  y_bins,
+  z_values,
+  x_output_channel,
+  y_output_channel,
+  onBack,
+  embedded = false,
+  onOpenInTab,
+  onValuesChange,
+}: TableEditor2DProps) {
+  const readOnly = !!useDialogValueSource()?.readOnly;
+  // Determine if data is valid - used for conditional rendering after hooks
+  const hasValidData = 
+    z_values && Array.isArray(z_values) && z_values.length > 0 &&
+    x_bins && Array.isArray(x_bins) && x_bins.length > 0 &&
+    y_bins && Array.isArray(y_bins) && y_bins.length > 0;
+
+  // Get realtime data from Zustand store for live cursor (ECU-agnostic)
+  const outputChannels = useMemo(() => {
+    const channels: string[] = [];
+    if (x_output_channel) channels.push(x_output_channel);
+    if (y_output_channel) channels.push(y_output_channel);
+    const output = resolveEmbeddedTableOutputChannel(table_name, x_output_channel, y_output_channel);
+    if (output) channels.push(output);
+    if (channels.length === 0) {
+      channels.push('rpm', 'map');
+    }
+    return channels;
+  }, [table_name, x_output_channel, y_output_channel]);
+  const realtimeData = useChannels(outputChannels);
+  
+  // Use safe fallback values for hooks when data is invalid
+  const safeZValues = hasValidData ? z_values : [[0]];
+  const safeXBins = hasValidData ? x_bins : [0];
+  const safeYBins = hasValidData ? y_bins : [0];
+  
+  // Renamed: every mutation goes through the `setLocalZValues` wrapper defined
+  // below, which persists as well as sets. Nothing should call this directly.
+  const [localZValues, setLocalZValuesState] = useState<number[][]>([...safeZValues]);
+  const [localXBins, setLocalXBins] = useState<number[]>([...safeXBins]);
+  const [localYBins, setLocalYBins] = useState<number[]>([...safeYBins]);
+
+  // Resync local edit state when the underlying table data changes out from
+  // under us — e.g. a tune:loaded refresh (useTableCurveRefresh) or this same
+  // mounted instance being reused for a different table/tune. Mirrors
+  // CurveEditor.tsx's equivalent effect. Without this, this component had no
+  // way to pick up new props once mounted (unless the caller happened to
+  // remount it via a changing `key`).
+  useEffect(() => {
+    if (hasValidData) {
+      setLocalZValuesState(z_values.map(row => [...row]));
+      setLocalXBins([...x_bins]);
+      setLocalYBins([...y_bins]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasValidData, z_values, x_bins, y_bins]);
+
+  const [selectionRange, setSelectionRange] = useState<SelectionRange | null>(null);
+  const [lockedCells, setLockedCells] = useState<Set<string>>(new Set());
+  const [historyTrail, setHistoryTrail] = useState<[number, number, number][]>([]);
+  const [showColorShade, setShowColorShade] = useState(true);
+  const [showHistoryTrail, setShowHistoryTrail] = useState(true);
+  const [show3D, setShow3D] = useState(false);
+
+  // Memoized so TableGrid (React.memo'd) doesn't see a new array reference —
+  // and re-render every cell — on renders where the trail itself hasn't
+  // changed (e.g. an unrelated realtime tick).
+  const visibleHistoryTrail = useMemo<[number, number][]>(
+    () => (showHistoryTrail ? historyTrail.map(([x, y]) => [x, y] as [number, number]) : EMPTY_HISTORY_TRAIL),
+    [showHistoryTrail, historyTrail]
+  );
+
+  // History Stack
+  type HistorySnapshot = {
+    z: number[][];
+    x: number[];
+    y: number[];
+  };
+  const [history, setHistory] = useState<HistorySnapshot[]>([{ 
+    z: [...safeZValues.map(row => [...row])],
+    x: [...safeXBins],
+    y: [...safeYBins] 
+  }]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+
+  const canUndo = historyIndex > 0;
+  const canRedo = historyIndex < history.length - 1;
+
+  const [rebinDialog, setRebinDialog] = useState<RebinDialogState>({
+    show: false,
+    newXBins: [...safeXBins],
+    newYBins: [...safeYBins],
+  });
+  const [sizeInfo, setSizeInfo] = useState<TableSizeInfo | null>(null);
+  const [setSizeOpen, setSetSizeOpen] = useState(false);
+  const [setSizeBusy, setSetSizeBusy] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{
+    visible: boolean;
+    x: number;
+    y: number;
+    value: number;
+    position?: { top: number; left: number };
+  }>({ visible: false, x: 0, y: 0, value: 0 });
+
+  const [cellEditDialog, setCellEditDialog] = useState<CellEditDialogState>({
+    show: false,
+    row: 0,
+    col: 0,
+    value: 0,
+  });
+
+  const [adjustDialog, setAdjustDialog] = useState<{
+    show: boolean;
+    kind: TableAdjustKind;
+    raw: string;
+    error: string | null;
+  }>({ show: false, kind: 'mul', raw: '0.9', error: null });
+
+  const [followMode, setFollowMode] = useState(true);
+  const [activeCell, setActiveCell] = useState<[number, number] | null>(null);
+
+  const { showToast } = useToast();
+
+  useEffect(() => {
+    if (readOnly) {
+      setSizeInfo(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<BackendTableData>('get_table_data', { tableName: table_name })
+      .then((data) => {
+        if (!cancelled) setSizeInfo(data.size_info ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setSizeInfo(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [table_name, readOnly]);
+
+  const [alertLargeChangeEnabled, setAlertLargeChangeEnabled] = useState(true);
+  const [alertLargeChangeAbs, setAlertLargeChangeAbs] = useState(5);
+  const [alertLargeChangePercent, setAlertLargeChangePercent] = useState(10);
+  
+  // Get heatmap scheme from user settings
+  const { settings: heatmapSettings } = useHeatmapSettings();
+  const yAxisBottom = useTableYAxisBottom();
+  const trailFadeSec = useTrailFadeSec();
+
+  // Whether this table can be seeded by the TunerStudio-style generator
+  // (VE / ignition / AFR target). Gates the "Generate…" context-menu action.
+  const generatableKind = useMemo(() => classifyGeneratableTable(table_name), [table_name]);
+  const [showGenerateDialog, setShowGenerateDialog] = useState(false);
+
+  // Show the read-only lambda companion only for actual target-AFR tables
+  // (not blend/bias tables whose values aren't AFR).
+  const isAfrTargetTable = table_name.toLowerCase().startsWith('afrtable');
+  // VE tables only (veTableTbl / veTable1Tbl…veTable4Tbl) — not MAF, blend, or other maps.
+  const fitVeViewport = /^vetable(\d+)?tbl$/i.test(table_name);
+
+  const selectedCellsCoords = useMemo(() => {
+    if (!selectionRange) return [];
+    
+    // Normalize coordinates (start logic might result in > end logic)
+    const minX = Math.min(selectionRange.start[0], selectionRange.end[0]);
+    const maxX = Math.max(selectionRange.start[0], selectionRange.end[0]);
+    const minY = Math.min(selectionRange.start[1], selectionRange.end[1]);
+    const maxY = Math.max(selectionRange.start[1], selectionRange.end[1]);
+    
+    const coords: [number, number][] = [];
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        coords.push([x, y]);
+      }
+    }
+    return coords;
+  }, [selectionRange]);
+
+  // --- Coordinate convention used throughout this file ---
+  // Selection/cell coords in the frontend are stored as [x, y] where x is the
+  // COLUMN and y is the ROW. The backend (table_ops, update_table_data) uses
+  // (row, col) order, so any payload crossing that boundary must swap:
+  const selectedCellsPayload = useMemo(
+    () => selectedCellsCoords.map(([x, y]) => [y, x] as [number, number]), // Backend expects (row, col)
+    [selectedCellsCoords]
+  );
+
+  const handleOperationError = useCallback(
+    (operation: string, err: unknown) => {
+      console.error(`${operation} failed:`, err);
+      const message = err instanceof Error ? err.message : String(err ?? 'Unknown error');
+      showToast(`${operation} failed: ${message}`, 'error');
+    },
+    [showToast]
+  );
+
+  /**
+   * Set the grid AND persist it. Every one of the seventeen mutation sites in
+   * this component calls this, so an operation cannot silently forget to save.
+   *
+   * It used to be a plain `useState` setter, and only the toolbar's "s" button
+   * pushed anything to the backend. The result: edits lived in component state
+   * alone, so switching tabs unmounted the grid and discarded them, and
+   * File -> Save As serialised the backend cache and wrote the pre-edit values
+   * with no warning. A real tuning session was lost that way twice - the table
+   * on screen and the table in the file simply disagreed.
+   *
+   * Persisting per edit writes the whole table each time, which is what undo
+   * and redo already did, so the cost is not new. If that ever matters on a
+   * slow link, debounce here rather than moving the call back out to the call
+   * sites, where the next new operation will forget it again.
+   */
+  const setLocalZValues = useCallback(
+    (values: number[][]) => {
+      setLocalZValuesState(values);
+      if (readOnly) return;
+      invoke('update_table_data', { tableName: table_name, zValues: values })
+        // Loudly. The previous `.then(() => {})` had no catch at all, so a
+        // rejected write left the grid showing values the ECU never received.
+        .catch((err) => handleOperationError('Saving table', err));
+    },
+    [table_name, handleOperationError, readOnly]
+  );
+
+  useEffect(() => {
+    invoke('get_settings')
+      .then((settings: any) => {
+        if (settings.alert_large_change_enabled !== undefined) {
+          setAlertLargeChangeEnabled(!!settings.alert_large_change_enabled);
+        }
+        if (settings.alert_large_change_abs !== undefined) {
+          setAlertLargeChangeAbs(settings.alert_large_change_abs);
+        }
+        if (settings.alert_large_change_percent !== undefined) {
+          setAlertLargeChangePercent(settings.alert_large_change_percent);
+        }
+      })
+      .catch((err) => console.warn('[TableEditor2D] Failed to load alert settings:', err));
+  }, []);
+
+  // Warn on suspiciously large single-cell changes. Two independent triggers:
+  //  - absolute delta (catches big raw swings on small values), and
+  //  - percent delta  (catches huge relative swings, e.g. 1 → 1000).
+  // Either firing raises a warning so the user notices a typo'd scale/offset.
+  // `Math.max(Math.abs(prev), 1e-6)` clamps the denominator away from zero so a
+  // prev value of 0 doesn't blow up to Infinity% (a 0→5 change would otherwise
+  // always look like an infinite increase).
+  const warnIfLargeChange = useCallback(
+    (prevValue: number, nextValue: number, operation: string) => {
+      if (!alertLargeChangeEnabled) return;
+      const absDelta = Math.abs(nextValue - prevValue);
+      const denom = Math.max(Math.abs(prevValue), 1e-6);
+      const pctDelta = (absDelta / denom) * 100;
+
+      if (absDelta >= alertLargeChangeAbs || pctDelta >= alertLargeChangePercent) {
+        showToast(
+          `${operation}: large change detected (Δ ${absDelta.toFixed(2)}, ${pctDelta.toFixed(1)}%)`,
+          'warning'
+        );
+      }
+    },
+    [alertLargeChangeEnabled, alertLargeChangeAbs, alertLargeChangePercent, showToast]
+  );
+
+  // Batch version of the above: scans a region (or the whole table when
+  // coords is null) and reports the count of cells that tripped either
+  // threshold plus the worst Δ / worst %. Same divide-by-zero guard per cell.
+  const warnIfLargeChangeBatch = useCallback(
+    (
+      previousValues: number[][],
+      nextValues: number[][],
+      coords: Array<[number, number]> | null,
+      operation: string
+    ) => {
+      if (!alertLargeChangeEnabled) return;
+
+      let maxAbs = 0;
+      let maxPct = 0;
+      let hits = 0;
+
+      const checkCell = (x: number, y: number) => {
+        const prev = previousValues?.[y]?.[x];
+        const next = nextValues?.[y]?.[x];
+        if (prev === undefined || next === undefined) return;
+        const absDelta = Math.abs(next - prev);
+        const denom = Math.max(Math.abs(prev), 1e-6);
+        const pctDelta = (absDelta / denom) * 100;
+        if (absDelta >= alertLargeChangeAbs || pctDelta >= alertLargeChangePercent) {
+          hits += 1;
+          maxAbs = Math.max(maxAbs, absDelta);
+          maxPct = Math.max(maxPct, pctDelta);
+        }
+      };
+
+      if (coords && coords.length > 0) {
+        coords.forEach(([x, y]) => checkCell(x, y));
+      } else {
+        for (let y = 0; y < nextValues.length; y += 1) {
+          for (let x = 0; x < nextValues[y].length; x += 1) {
+            checkCell(x, y);
+          }
+        }
+      }
+
+      if (hits > 0) {
+        showToast(
+          `${operation}: ${hits} cells exceeded thresholds (max Δ ${maxAbs.toFixed(2)}, ${maxPct.toFixed(1)}%)`,
+          'warning'
+        );
+      }
+    },
+    [alertLargeChangeEnabled, alertLargeChangeAbs, alertLargeChangePercent, showToast]
+  );
+
+  // Push a new entry onto the undo stack. Three subtleties:
+  //  1. Redo truncation: any redo entries past `historyIndex` are sliced off
+  //     before the new entry is pushed (standard editor semantics — once you
+  //     edit after undoing, the redo future is discarded).
+  //  2. 50-step cap: once full, the oldest entry is shifted out. `historyIndex`
+  //     is then clamped to 49 to keep it within the (now shifted) array.
+  //  3. Stale-closure risk: this callback closes over `historyIndex`, so the
+  //     `prev.slice(0, historyIndex + 1)` and the `setHistoryIndex` use the
+  //     value from when the callback was built. The dep array includes
+  //     `historyIndex` so the callback is rebuilt each step — keep that dep if
+  //     you refactor, or the slice will lag by one change.
+  const pushHistory = useCallback((newZ: number[][], newX: number[], newY: number[]) => {
+    setHistory(prev => {
+      // Remove any redo history if we make a new change
+      const newHistory = prev.slice(0, historyIndex + 1);
+      newHistory.push({ 
+        z: newZ.map(row => [...row]), 
+        x: [...newX], 
+        y: [...newY] 
+      });
+      // Limit history size (optional, e.g. 50 steps)
+      if (newHistory.length > 50) newHistory.shift();
+      return newHistory;
+    });
+    setHistoryIndex(prev => Math.min(prev + 1, 49));
+  }, [historyIndex]);
+
+  // Trail of recent live operating points (trace)
+  const realtimeRef = useRef(realtimeData);
+  realtimeRef.current = realtimeData;
+  useEffect(() => {
+    if (!followMode) {
+      setHistoryTrail([]);
+      return;
+    }
+    const nearest = (value: number, bins: number[]) => {
+      let best = 0;
+      let diff = Infinity;
+      bins.forEach((b, i) => {
+        const d = Math.abs(b - value);
+        if (d < diff) {
+          diff = d;
+          best = i;
+        }
+      });
+      return best;
+    };
+    const ttlMs = trailFadeSec > 0 ? trailFadeSec * 1000 : Infinity;
+    const interval = setInterval(() => {
+      const data = realtimeRef.current;
+      const xv = x_output_channel ? data?.[x_output_channel] : data?.rpm;
+      const yv = y_output_channel ? data?.[y_output_channel] : data?.map;
+      if (xv === undefined || yv === undefined) return;
+      const now = Date.now();
+      const cell: [number, number] = [nearest(xv, localXBins), nearest(yv, localYBins)];
+      setHistoryTrail((prev) => {
+        const kept = prev.filter(([, , t]) => now - t < ttlMs);
+        const last = kept[kept.length - 1];
+        if (last && last[0] === cell[0] && last[1] === cell[1]) {
+          return kept.length === prev.length ? prev : kept;
+        }
+        return [...kept.slice(-49), [cell[0], cell[1], now]];
+      });
+    }, 250);
+    return () => clearInterval(interval);
+  }, [followMode, x_output_channel, y_output_channel, localXBins, localYBins, trailFadeSec]);
+
+  // Keyboard event handling for TS-style hotkeys
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't handle if typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+      if (adjustDialog.show) return;
+
+      const isCtrl = e.ctrlKey || e.metaKey;
+      const isShift = e.shiftKey;
+      // handleIncrease/handleDecrease take a fraction, not a multiplier.
+      const stepFraction = isCtrl ? 0.05 : 0.01;
+      
+      // Build composite key for Ctrl+key combinations
+      const getKeyCombo = (key: string): string => {
+        if (isCtrl && key.length === 1) {
+          return `Ctrl+${key.toUpperCase()}`;
+        }
+        return key;
+      };
+      
+      const keyCombo = getKeyCombo(e.key);
+      const hotkeyManager = getHotkeyManager();
+
+      // Check if keyboard event matches a custom binding or default
+      const matchesAction = (actionId: string): boolean => {
+        return hotkeyManager.matchesBinding(actionId, keyCombo) || 
+               (hotkeyManager.getBindingForAction(actionId) === '' && matchesDefaultBinding(actionId, e.key));
+      };
+      
+      const matchesDefaultBinding = (actionId: string, key: string): boolean => {
+        // Fallback to default bindings if no custom binding is set
+        const defaults: Record<string, string[]> = {
+          'table.navigateUp': ['ArrowUp'],
+          'table.navigateDown': ['ArrowDown'],
+          'table.navigateLeft': ['ArrowLeft'],
+          'table.navigateRight': ['ArrowRight'],
+          'table.setEqual': ['='],
+          'table.increase': ['>', '.', 'q'],
+          'table.decrease': ['<', ',', '-', '_'],
+          'table.increaseMultiple': ['+'],
+          'table.scale': ['*'],
+          'table.interpolate': ['/'],
+          'table.interpolateHorizontal': ['h', 'H'],
+          'table.interpolateVertical': ['v', 'V'],
+          'table.smooth': ['s', 'S'],
+          'table.toggleFollowMode': ['f', 'F'],
+          'table.jumpToActive': ['g', 'G'],
+          'table.copy': ['Ctrl+C'],
+          'table.paste': ['Ctrl+V'],
+          'table.undo': ['Ctrl+Z'],
+          'table.escape': ['Escape'],
+        };
+        return (defaults[actionId] || []).includes(key);
+      };
+
+      // Navigation
+      if (matchesAction('table.navigateUp') || e.key === 'ArrowUp') {
+        e.preventDefault();
+        handleArrowNavigation('ArrowUp', isShift);
+        return;
+      }
+      if (matchesAction('table.navigateDown') || e.key === 'ArrowDown') {
+        e.preventDefault();
+        handleArrowNavigation('ArrowDown', isShift);
+        return;
+      }
+      if (matchesAction('table.navigateLeft') || e.key === 'ArrowLeft') {
+        e.preventDefault();
+        handleArrowNavigation('ArrowLeft', isShift);
+        return;
+      }
+      if (matchesAction('table.navigateRight') || e.key === 'ArrowRight') {
+        e.preventDefault();
+        handleArrowNavigation('ArrowRight', isShift);
+        return;
+      }
+
+      // Cell operations
+      if (matchesAction('table.setEqual') || e.key === '=') {
+        e.preventDefault();
+        handleSetEqual();
+        return;
+      }
+      // Page keys adjust by an absolute step (0.1 plain, 1 with Shift,
+      // 0.05 with Ctrl), unlike '>'/'<' which scale by a percentage.
+      if (e.key === 'PageUp' || e.key === 'PageDown') {
+        e.preventDefault();
+        const magnitude = isShift ? 1 : isCtrl ? 0.05 : 0.1;
+        handleAdjustBy(magnitude * (e.key === 'PageUp' ? 1 : -1));
+        return;
+      }
+      if (matchesAction('table.increase') || ['>', '.', 'q'].includes(e.key)) {
+        e.preventDefault();
+        handleIncrease(stepFraction);
+        return;
+      }
+      if (matchesAction('table.decrease') || ['<', ',', '-', '_'].includes(e.key)) {
+        e.preventDefault();
+        handleDecrease(stepFraction);
+        return;
+      }
+      if (matchesAction('table.increaseMultiple') || e.key === '+') {
+        e.preventDefault();
+        handleIncrease(10 * stepFraction);
+        return;
+      }
+      if (matchesAction('table.scale') || e.key === '*') {
+        e.preventDefault();
+        openAdjust('mul');
+        return;
+      }
+      if (matchesAction('table.interpolate') || e.key === '/') {
+        e.preventDefault();
+        handleInterpolate();
+        return;
+      }
+      if ((matchesAction('table.interpolateHorizontal') || ['h', 'H'].includes(e.key)) && !isCtrl) {
+        e.preventDefault();
+        handleInterpolateLinear('row');
+        return;
+      }
+      // V is guarded so Ctrl+V still reaches the paste handler below.
+      if ((matchesAction('table.interpolateVertical') || ['v', 'V'].includes(e.key)) && !isCtrl) {
+        e.preventDefault();
+        handleInterpolateLinear('col');
+        return;
+      }
+      if ((matchesAction('table.smooth') || ['s', 'S'].includes(e.key)) && !isCtrl) {
+        e.preventDefault();
+        handleSmooth();
+        return;
+      }
+
+      // View controls
+      if ((matchesAction('table.toggleFollowMode') || ['f', 'F'].includes(e.key)) && !isCtrl) {
+        e.preventDefault();
+        setFollowMode(!followMode);
+        return;
+      }
+      if (matchesAction('table.jumpToActive') || ['g', 'G'].includes(e.key)) {
+        e.preventDefault();
+        // Go to live position (jump to active cell)
+        if (activeCell) {
+          setSelectionRange({ start: activeCell, end: activeCell });
+        }
+        return;
+      }
+
+      // Copy/Paste
+      if (matchesAction('table.copy') || (isCtrl && (e.key === 'c' || e.key === 'C'))) {
+        e.preventDefault();
+        handleCopy();
+        return;
+      }
+      if (matchesAction('table.paste') || (isCtrl && (e.key === 'v' || e.key === 'V'))) {
+        e.preventDefault();
+        handlePaste();
+        return;
+      }
+      if (matchesAction('table.undo') || (isCtrl && (e.key === 'z' || e.key === 'Z'))) {
+        e.preventDefault();
+        if (isShift) {
+          handleRedo();
+        } else {
+          handleUndo();
+        }
+        return;
+      }
+      if (isCtrl && (e.key === 'y' || e.key === 'Y')) {
+        e.preventDefault();
+        handleRedo();
+        return;
+      }
+
+      // Escape to clear selection
+      if (matchesAction('table.escape') || e.key === 'Escape') {
+        e.preventDefault();
+        setSelectionRange(null);
+        setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
+        return;
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [selectionRange, followMode, activeCell, localZValues, yAxisBottom, adjustDialog.show]);
+
+  // Arrow key navigation helper
+  const handleArrowNavigation = (key: string, extendSelection: boolean) => {
+    if (!selectionRange) {
+      // Start from top-left if no selection
+      setSelectionRange({ start: [0, 0], end: [0, 0] });
+      return;
+    }
+
+    // Use current end as base for movement
+    const [currentX, currentY] = selectionRange.end;
+
+    let newX = currentX;
+    let newY = currentY;
+
+    // With the bottom-left origin, visually "up" is the next data row
+    const upDelta = yAxisBottom ? 1 : -1;
+
+    switch (key) {
+      case 'ArrowUp':
+        newY = Math.min(y_bins.length - 1, Math.max(0, currentY + upDelta));
+        break;
+      case 'ArrowDown':
+        newY = Math.min(y_bins.length - 1, Math.max(0, currentY - upDelta));
+        break;
+      case 'ArrowLeft':
+        newX = Math.max(0, currentX - 1);
+        break;
+      case 'ArrowRight':
+        newX = Math.min(x_bins.length - 1, currentX + 1);
+        break;
+    }
+
+    if (extendSelection) {
+      // Extend selection: keep start, update end
+      setSelectionRange({ ...selectionRange, end: [newX, newY] });
+    } else {
+      // Move selection: both start and end move to new cell
+      setSelectionRange({ start: [newX, newY], end: [newX, newY] });
+    }
+    setActiveCell([newX, newY]);
+  };
+
+  // Memoized (React.memo'd TableGrid relies on these staying referentially
+  // stable across renders that don't actually change table state — e.g. a
+  // realtime tick unrelated to this table — otherwise memo does nothing).
+  const handleCellChange = useCallback((
+    x: number,
+    y: number,
+    value: number,
+    options?: { suppressAlert?: boolean; operation?: string }
+  ) => {
+    const prevValue = localZValues[y][x];
+    const newValues = localZValues.map(row => [...row]);
+    newValues[y][x] = value;
+
+    setLocalZValues(newValues);
+    setSelectionRange({ start: [x,y], end: [x,y] });
+    pushHistory(newValues, localXBins, localYBins);
+    onValuesChange?.(newValues);
+
+    if (!options?.suppressAlert) {
+      warnIfLargeChange(prevValue, value, options?.operation ?? 'Cell edit');
+    }
+  }, [localZValues, localXBins, localYBins, setLocalZValues, pushHistory, onValuesChange, warnIfLargeChange]);
+
+  const handleAxisChange = useCallback((axis: 'x' | 'y', index: number, value: number) => {
+    if (axis === 'x') {
+      const newBins = [...localXBins];
+      newBins[index] = value;
+      setLocalXBins(newBins);
+      setRebinDialog(prev => ({ ...prev, newXBins: newBins }));
+      pushHistory(localZValues, newBins, localYBins);
+    } else {
+      const newBins = [...localYBins];
+      newBins[index] = value;
+      setLocalYBins(newBins);
+      setRebinDialog(prev => ({ ...prev, newYBins: newBins }));
+      pushHistory(localZValues, localXBins, newBins);
+    }
+  }, [localXBins, localYBins, localZValues, pushHistory]);
+
+  // TunerStudio-compatible .table file import/export for this one table.
+  // import_table_from_file already writes the result to the tune/ECU cache
+  // on the backend; this just brings the local editor state (and undo
+  // stack) in sync with what was just written.
+  const handleExportTable = useCallback(async () => {
+    try {
+      const path = await save({
+        title: 'Save Table to File',
+        defaultPath: `${table_name}.table`,
+        filters: [{ name: 'TunerStudio Table', extensions: ['table'] }],
+      });
+      if (!path) return;
+      await invoke('export_table_to_file', { tableName: table_name, path });
+    } catch (err) {
+      showToast(`Failed to save table: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [table_name, showToast]);
+
+  const handleImportTable = useCallback(async () => {
+    try {
+      const path = await open({
+        title: 'Load Table from File',
+        filters: [{ name: 'TunerStudio Table', extensions: ['table'] }],
+        multiple: false,
+        directory: false,
+      });
+      if (!path) return;
+      const result = await invoke<BackendTableData>('import_table_from_file', {
+        tableName: table_name,
+        path,
+      });
+      setLocalXBins(result.x_bins);
+      setLocalYBins(result.y_bins);
+      setLocalZValues(result.z_values);
+      pushHistory(result.z_values, result.x_bins, result.y_bins);
+      onValuesChange?.(result.z_values);
+    } catch (err) {
+      showToast(`Failed to load table: ${err instanceof Error ? err.message : String(err)}`, 'error');
+    }
+  }, [table_name, showToast, pushHistory, onValuesChange]);
+
+  /**
+   * "Ask AI about this table": open the assistant panel with the table's
+   * name/title and the current selection as context. The panel listens for
+   * `agent:ask` (App.tsx opens the panel on the same event), so no props
+   * need threading through the layout.
+   */
+  const handleAskAi = useCallback(() => {
+    const cells =
+      selectionRange == null
+        ? []
+        : [
+            [selectionRange.start[0], selectionRange.start[1]],
+            [selectionRange.end[0], selectionRange.end[1]],
+          ];
+    void emit('agent:ask', {
+      table: table_name,
+      title,
+      cells,
+      axes: { x: x_axis_name, y: y_axis_name },
+    });
+  }, [table_name, title, selectionRange, x_axis_name, y_axis_name]);
+
+  const handleSetEqual = async () => {
+    const values = selectedCellsCoords.map(([x, y]) => {
+      return { x, y, value: localZValues[y][x] };
+    });
+
+    if (values.length === 0) return;
+
+    const avgValue = values.reduce((sum, v) => sum + v.value, 0) / values.length;
+
+    const previousValues = localZValues.map((row) => [...row]);
+
+    try {
+      const result = await invoke<TableOperationResult>('set_cells_equal', {
+        tableName: table_name,
+        selectedCells: selectedCellsPayload,
+        value: avgValue
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, localXBins, localYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, selectedCellsCoords, 'Set equal');
+      }
+    } catch (err) {
+      handleOperationError('Set equal', err);
+    }
+  };
+
+  const handleSetEqualWrapper = () => {
+    setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
+    handleSetEqual();
+  };
+
+  const handleContextMenuSetEqual = (_value: number) => {
+    setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
+    handleSetEqual();
+  };
+
+  const handleContextMenuScale = (factor: number) => {
+    setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
+    handleScale(factor);
+  };
+
+  /** Apply a transform to every selected cell in ONE state update.
+   *  Going through handleCellChange per cell loses all but the last cell
+   *  (each call clones the same stale localZValues) and collapses the
+   *  selection to a single cell. */
+  const applyToSelection = (fn: (value: number) => number) => {
+    if (selectedCellsCoords.length === 0) return;
+    const newValues = localZValues.map(row => [...row]);
+    selectedCellsCoords.forEach(([x, y]) => {
+      newValues[y][x] = fn(newValues[y][x]);
+    });
+    setLocalZValues(newValues);
+    pushHistory(newValues, localXBins, localYBins);
+    onValuesChange?.(newValues);
+  };
+
+  /** Add a fixed amount to every selected cell (Page Up/Down) */
+  const handleAdjustBy = (amount: number) => applyToSelection((v) => v + amount);
+
+  const handleIncrease = (amount: number) => applyToSelection((v) => v * (1 + amount));
+
+  const handleDecrease = (amount: number) => applyToSelection((v) => v * (1 - amount));
+
+  const handleScale = async (factor: number) => {
+    const previousValues = localZValues.map((row) => [...row]);
+    try {
+      const result = await invoke<TableOperationResult>('scale_cells', {
+        tableName: table_name,
+        selectedCells: selectedCellsPayload,
+        scaleFactor: factor
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, localXBins, localYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, selectedCellsCoords, 'Scale');
+      }
+    } catch (err) {
+      handleOperationError('Scale', err);
+    }
+  };
+
+  const openAdjust = (kind: TableAdjustKind) => {
+    if (selectedCellsCoords.length === 0) return;
+    setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
+    setAdjustDialog({
+      show: true,
+      kind,
+      raw: kind === 'mul' ? '0.9' : '10',
+      error: null,
+    });
+  };
+
+  const applyAdjust = () => {
+    const parsed = parseTableAdjustInput(adjustDialog.raw, adjustDialog.kind);
+    if (!parsed.ok) {
+      setAdjustDialog((d) => ({ ...d, error: parsed.error }));
+      return;
+    }
+    const values = selectedCellsCoords.map(([x, y]) => localZValues[y][x]);
+    const next = tableAdjustTransform(adjustDialog.kind, parsed.value);
+    const resultError = tableAdjustResultError(values, next, { tableKind: generatableKind });
+    if (resultError) {
+      setAdjustDialog((d) => ({ ...d, error: resultError }));
+      return;
+    }
+    if (adjustDialog.kind === 'mul') handleScale(parsed.value);
+    else handleAddOffset(adjustDialog.kind === 'add' ? parsed.value : -parsed.value);
+    setAdjustDialog((d) => ({ ...d, show: false, error: null }));
+  };
+
+  const handleSmooth = async () => {
+    const previousValues = localZValues.map((row) => [...row]);
+    try {
+      const result = await invoke<TableOperationResult>('smooth_table', {
+        tableName: table_name,
+        selectedCells: selectedCellsPayload,
+        factor: 1.0
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, localXBins, localYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, selectedCellsCoords, 'Smooth');
+      }
+    } catch (err) {
+      handleOperationError('Smooth', err);
+    }
+  };
+
+  // Apply a freshly generated grid (from GenerateTableDialog) as a single
+  // undoable edit. This is an intentional full-table reseed, so unlike the
+  // cell operations it doesn't run the large-change guard.
+  const handleGenerateApply = (result: { zValues: number[][]; xBins?: number[]; yBins?: number[] }) => {
+    const newX = result.xBins ?? localXBins;
+    const newY = result.yBins ?? localYBins;
+    setLocalZValues(result.zValues);
+    if (result.xBins) setLocalXBins(result.xBins);
+    if (result.yBins) setLocalYBins(result.yBins);
+    onValuesChange?.(result.zValues);
+    pushHistory(result.zValues, newX, newY);
+  };
+
+  const handleInterpolate = async () => {
+    const previousValues = localZValues.map((row) => [...row]);
+    try {
+      const result = await invoke<TableOperationResult>('interpolate_cells', {
+        tableName: table_name,
+        selectedCells: selectedCellsPayload
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, localXBins, localYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, selectedCellsCoords, 'Interpolate');
+      }
+    } catch (err) {
+      handleOperationError('Interpolate', err);
+    }
+  };
+
+  const handleAddOffset = async (offset: number) => {
+    const previousValues = localZValues.map((row) => [...row]);
+    try {
+      const result = await invoke<TableOperationResult>('add_offset', {
+        tableName: table_name,
+        selectedCells: selectedCellsPayload,
+        offset: offset
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, localXBins, localYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, selectedCellsCoords, 'Offset');
+      }
+    } catch (err) {
+      handleOperationError('Offset', err);
+    }
+  };
+
+  const handleInterpolateLinear = async (axis: 'row' | 'col') => {
+    const previousValues = localZValues.map((row) => [...row]);
+    try {
+      const result = await invoke<TableOperationResult>('interpolate_linear', {
+        tableName: table_name,
+        selectedCells: selectedCellsPayload,
+        axis: axis
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, localXBins, localYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, selectedCellsCoords, 'Linear Interpolate');
+      }
+    } catch (err) {
+      handleOperationError('Linear Interpolate', err);
+    }
+  };
+
+  const handleFill = async (direction: 'right' | 'down') => {
+    const previousValues = localZValues.map((row) => [...row]);
+    try {
+      const result = await invoke<TableOperationResult>('fill_region', {
+        tableName: table_name,
+        selectedCells: selectedCellsPayload,
+        direction: direction
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        onValuesChange?.(result.z_values);
+        pushHistory(result.z_values, localXBins, localYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, selectedCellsCoords, 'Fill Region');
+      }
+    } catch (err) {
+      handleOperationError('Fill Region', err);
+    }
+  };
+
+  const handleNudge = (up: boolean, large: boolean) => {
+    const amount = large ? 0.05 : 0.01; 
+    if (up) handleIncrease(amount);
+    else handleDecrease(amount);
+  };
+
+  const handleSetTableSize = async (cols: number, rows: number) => {
+    setSetSizeBusy(true);
+    try {
+      const result = await invoke<BackendTableData>('resize_table_size', {
+        tableName: table_name,
+        newCols: cols,
+        newRows: rows,
+      });
+      pushHistory(result.z_values, result.x_bins, result.y_bins);
+      setLocalXBins(result.x_bins);
+      setLocalYBins(result.y_bins);
+      setLocalZValues(result.z_values);
+      setSizeInfo(result.size_info ?? null);
+      setRebinDialog({ show: false, newXBins: result.x_bins, newYBins: result.y_bins });
+      onValuesChange?.(result.z_values);
+      setSetSizeOpen(false);
+      showToast(`Table resized to ${rows}x${cols}`, 'success');
+    } catch (err) {
+      handleOperationError('Set table size', err);
+    } finally {
+      setSetSizeBusy(false);
+    }
+  };
+
+  const handleRebin = async (newXBins: number[], newYBins: number[], interpolateZ: boolean) => {
+    setRebinDialog({ show: false, newXBins, newYBins });
+
+    const previousValues = localZValues.map((row) => [...row]);
+
+    try {
+      const result = await invoke<TableOperationResult>('rebin_table', {
+        tableName: table_name,
+        newXBins: newXBins,
+        newYBins: newYBins,
+        interpolateZ: interpolateZ
+      });
+      if (result && result.z_values) {
+        setLocalZValues(result.z_values);
+        setLocalXBins(newXBins);
+        setLocalYBins(newYBins);
+        onValuesChange?.(result.z_values);
+        setSelectionRange(null);
+        pushHistory(result.z_values, newXBins, newYBins);
+        warnIfLargeChangeBatch(previousValues, result.z_values, null, 'Rebin');
+      }
+    } catch (err) {
+      handleOperationError('Rebin', err);
+    }
+  };
+
+  const handleCellEditApply = (value: number) => {
+    handleCellChange(cellEditDialog.col, cellEditDialog.row, value, { operation: 'Cell edit' });
+  };
+
+  const handleCellDoubleClick = useCallback((x: number, y: number) => {
+    setCellEditDialog({
+      show: true,
+      row: y,
+      col: x,
+      value: localZValues[y][x],
+    });
+  }, [localZValues]);
+
+  const handleCopy = async () => {
+    if (!selectionRange) return;
+
+    const minX = Math.min(selectionRange.start[0], selectionRange.end[0]);
+    const maxX = Math.max(selectionRange.start[0], selectionRange.end[0]);
+    const minY = Math.min(selectionRange.start[1], selectionRange.end[1]);
+    const maxY = Math.max(selectionRange.start[1], selectionRange.end[1]);
+
+    const rows: string[] = [];
+    for (let y = minY; y <= maxY; y++) {
+      const rowValues: string[] = [];
+      for (let x = minX; x <= maxX; x++) {
+        rowValues.push(localZValues[y][x].toString());
+      }
+      rows.push(rowValues.join('\t'));
+    }
+
+    const text = rows.join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      // Optional: Visual feedback or toast could go here
+    } catch (err) {
+      console.error('Failed to copy to clipboard:', err);
+    }
+  };
+
+  const handlePaste = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) return;
+
+      // Determine paste anchor (top-left of selection)
+      const startX = selectionRange 
+        ? Math.min(selectionRange.start[0], selectionRange.end[0]) 
+        : (activeCell ? activeCell[0] : 0);
+      const startY = selectionRange 
+        ? Math.min(selectionRange.start[1], selectionRange.end[1]) 
+        : (activeCell ? activeCell[1] : 0);
+
+      // Parse data (handle standard TSV/CSV)
+      const rows = text.split(/\r?\n/).filter(line => line.trim() !== '');
+      if (rows.length === 0) return;
+
+      // Create new table state
+      const newValues = localZValues.map(row => [...row]);
+      let hasChanges = false;
+
+      rows.forEach((line, r) => {
+        const y = startY + r;
+        if (y >= y_bins.length) return;
+
+        // Auto-detect the delimiter: prefer tab (the clipboard format Excel
+        // and most spreadsheets use when you copy a block) and fall back to
+        // comma (loose CSV). Mixed delimiters in one paste aren't supported —
+        // the first hit wins for the whole line.
+        const delimiter = line.includes('\t') ? '\t' : ',';
+        const cols = line.split(delimiter);
+
+        cols.forEach((valStr, c) => {
+          const x = startX + c;
+          if (x >= x_bins.length) return;
+
+          const val = parseFloat(valStr.trim());
+          if (!isNaN(val)) {
+            // Locked cells are immune to paste — this is how a user protects a
+            // known-good region while pasting around it (e.g. copy a column
+            // from another tune without clobbering locked VE cells).
+            const targetKey = `${x},${y}`;
+            if (!lockedCells.has(targetKey)) {
+              if (newValues[y][x] !== val) {
+                newValues[y][x] = val;
+                hasChanges = true;
+              }
+            }
+          }
+        });
+      });
+
+      if (hasChanges) {
+        // setLocalZValues persists; no second write.
+        setLocalZValues(newValues);
+        pushHistory(newValues, localXBins, localYBins);
+        
+        // Update selection to cover pasted area
+        const endY = Math.min(startY + rows.length - 1, y_bins.length - 1);
+        const maxCols = Math.max(...rows.map(r => r.split(r.includes('\t') ? '\t' : ',').length));
+        const endX = Math.min(startX + maxCols - 1, x_bins.length - 1);
+        
+        setSelectionRange({
+          start: [startX, startY],
+          end: [endX, endY]
+        });
+      }
+    } catch (err) {
+      console.error('Failed to paste from clipboard:', err);
+    }
+  };
+
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+      const prevIndex = historyIndex - 1;
+      const snapshot = history[prevIndex];
+      
+      setLocalZValues(snapshot.z);
+      setLocalXBins(snapshot.x);
+      setLocalYBins(snapshot.y);
+      setRebinDialog(prev => ({ ...prev, newXBins: snapshot.x, newYBins: snapshot.y }));
+      
+      setHistoryIndex(prevIndex);
+      onValuesChange?.(snapshot.z);
+      
+      // The z values are persisted by setLocalZValues above. Axis bins are
+      // still local-only: there is no command to write them, so an undo that
+      // crosses a re-bin restores the grid but not the ECU's axes.
+    }
+  };
+
+  const handleRedo = () => {
+    if (historyIndex < history.length - 1) {
+      const nextIndex = historyIndex + 1;
+      const snapshot = history[nextIndex];
+      
+      setLocalZValues(snapshot.z);
+      setLocalXBins(snapshot.x);
+      setLocalYBins(snapshot.y);
+      setRebinDialog(prev => ({ ...prev, newXBins: snapshot.x, newYBins: snapshot.y }));
+      
+      setHistoryIndex(nextIndex);
+      onValuesChange?.(snapshot.z);
+
+    }
+  };
+
+  const handleCellLock = useCallback((x: number, y: number, locked: boolean) => {
+    const key = `${x},${y}`;
+    const newLocked = new Set(lockedCells);
+    if (locked) {
+      newLocked.add(key);
+    } else {
+      newLocked.delete(key);
+    }
+    setLockedCells(newLocked);
+  }, [lockedCells]);
+
+  const handleSelectionChange = useCallback((range: SelectionRange | null) => {
+    setSelectionRange(range);
+    if (range) {
+      setActiveCell(range.end);
+      setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
+    }
+  }, []);
+
+  /**
+   * Explicit re-send. Edits already persist as they are made, so this is now a
+   * "push it again" for when the ECU was offline at the time - not the only
+   * thing standing between a session's work and losing it, which is what it
+   * used to be.
+   */
+  const handleSave = () => {
+    invoke('update_table_data', { tableName: table_name, zValues: localZValues })
+      .then(() => showToast('Table sent to the ECU', 'success'))
+      .catch((err) => handleOperationError('Saving table', err));
+  };
+
+  const handleRightClick = (e: React.MouseEvent, x: number, y: number, cell: HTMLElement) => {
+    e.preventDefault();
+
+    // Every menu action except lock/unlock operates on the selection, so a
+    // right-click outside it would silently target a different region.
+    if (!selectedCellsCoords.some(([sx, sy]) => sx === x && sy === y)) {
+      setSelectionRange({ start: [x, y], end: [x, y] });
+    }
+
+    const rect = cell.getBoundingClientRect();
+    setContextMenu({
+      visible: true,
+      x,
+      y,
+      value: localZValues[y][x],
+      position: {
+        top: rect.top,
+        left: rect.left
+      }
+    });
+  };
+
+  // Render error state if data is invalid (after all hooks have been called)
+  if (!hasValidData) {
+    const getErrorMessage = () => {
+      if (!z_values || !Array.isArray(z_values) || z_values.length === 0) {
+        return `No Z-values available for table "${title || table_name}". The table data may be missing or improperly formatted in the tune file.`;
+      }
+      if (!x_bins || !Array.isArray(x_bins) || x_bins.length === 0) {
+        return `No X-axis bins available for table "${title || table_name}".`;
+      }
+      if (!y_bins || !Array.isArray(y_bins) || y_bins.length === 0) {
+        return `No Y-axis bins available for table "${title || table_name}".`;
+      }
+      return 'Unknown table data error.';
+    };
+
+    return (
+      <div className="table-editor" style={{ padding: '20px', textAlign: 'center' }}>
+        <h3 style={{ color: 'var(--error)', marginBottom: '8px', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          <AlertTriangle size={20} aria-hidden /> Table Data Error
+        </h3>
+        <p style={{ color: 'var(--text-muted)' }}>{getErrorMessage()}</p>
+        {onBack && (
+          <button onClick={onBack} style={{ marginTop: '16px', display: 'inline-flex', alignItems: 'center', gap: 6 }} className="btn btn-secondary">
+            <ArrowLeft size={14} /> Go Back
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`table-editor-2d ${embedded ? 'embedded' : 'standalone'}${fitVeViewport ? ' table-editor-2d--ve-fit' : ''}${readOnly ? ' is-readonly' : ''}`}
+    >
+      {/* Embedded mode: compact title bar with pop-out button */}
+      {embedded && (
+        <div className="embedded-header">
+          <span className="embedded-title">{title}</span>
+          {!readOnly && (
+            <>
+              <button
+                className="embedded-toggle"
+                disabled={selectedCellsCoords.length === 0}
+                onClick={() => openAdjust('sub')}
+                title="Decrease — subtract an amount (−)"
+              >
+                −
+              </button>
+              <button
+                className="embedded-toggle"
+                disabled={selectedCellsCoords.length === 0}
+                onClick={() => openAdjust('add')}
+                title="Increase — add an amount (+)"
+              >
+                +
+              </button>
+              <button
+                className="embedded-toggle"
+                disabled={selectedCellsCoords.length === 0}
+                onClick={() => openAdjust('mul')}
+                title="Multiply (×)"
+              >
+                ×
+              </button>
+            </>
+          )}
+          <button 
+            className={`embedded-toggle ${showColorShade ? 'active' : ''}`}
+            onClick={() => setShowColorShade(!showColorShade)}
+            title="Toggle Color Shade"
+            aria-label="Toggle Color Shade"
+          >
+            <Palette size={14} />
+          </button>
+          <button 
+            className={`embedded-toggle ${show3D ? 'active' : ''}`}
+            onClick={() => setShow3D(!show3D)}
+            title="Toggle 3D View"
+            aria-label="Toggle 3D View"
+          >
+            <Box size={14} />
+          </button>
+          <button
+            className={`embedded-toggle ${yAxisBottom ? 'active' : ''}`}
+            onClick={() => setTableYAxisBottom(!yAxisBottom)}
+            title={`Y axis zero at ${yAxisBottom ? 'bottom' : 'top'} - click to flip`}
+            aria-pressed={yAxisBottom}
+            aria-label="Y axis zero at bottom"
+          >
+            <ArrowUpDown size={14} />
+          </button>
+          {sizeInfo?.resizable && (
+            <button
+              className="embedded-toggle"
+              onClick={() => setSetSizeOpen(true)}
+              title="Set table size"
+              aria-label="Set table size"
+            >
+              <Scaling size={14} />
+            </button>
+          )}
+          {onOpenInTab && (
+            <button 
+              className="pop-out-btn" 
+              onClick={onOpenInTab}
+              title="Open in new tab"
+            >
+              <ExternalLink size={14} />
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Standalone mode: full header with back button and actions */}
+      {!embedded && (
+        <div className="editor-header">
+          <button className="back-btn" onClick={onBack}>
+            <ArrowLeft size={18} />
+            <span>Back</span>
+          </button>
+          <h1>{title}</h1>
+          <div className="editor-actions">
+            <button 
+              className={`action-btn ${showColorShade ? 'active' : ''}`}
+              onClick={() => setShowColorShade(!showColorShade)}
+              title="Toggle Color Shade"
+              aria-label="Toggle Color Shade"
+            >
+              <span className="action-icon"><Palette size={16} /></span>
+            </button>
+            <button 
+              className={`action-btn ${showHistoryTrail ? 'active' : ''}`}
+              onClick={() => setShowHistoryTrail(!showHistoryTrail)}
+              title="Toggle History Trail"
+              aria-label="Toggle History Trail"
+            >
+              <span className="action-icon"><MapPin size={16} /></span>
+            </button>
+            <button 
+              className={`action-btn ${followMode ? 'active' : ''}`}
+              onClick={() => setFollowMode(!followMode)}
+              title="Follow Mode (F)"
+              aria-label="Follow Mode"
+            >
+              <span className="action-icon"><Crosshair size={16} /></span>
+            </button>
+            <button 
+              className={`action-btn ${show3D ? 'active' : ''}`}
+              onClick={() => setShow3D(!show3D)}
+              title="Toggle 3D View"
+              aria-label="Toggle 3D View"
+            >
+              <span className="action-icon"><Box size={16} /></span>
+            </button>
+            <button
+              className={`action-btn ${yAxisBottom ? 'active' : ''}`}
+              onClick={() => setTableYAxisBottom(!yAxisBottom)}
+              title={`Y axis zero at ${yAxisBottom ? 'bottom' : 'top'} - click to flip`}
+              aria-pressed={yAxisBottom}
+              aria-label="Y axis zero at bottom"
+            >
+              <span className="action-icon"><ArrowUpDown size={16} /></span>
+            </button>
+            <button className="action-btn" onClick={handleSave} title="Save (S)">
+              <Save size={18} />
+            </button>
+            <button className="action-btn" onClick={handleUndo} disabled={!canUndo} title="Undo (Ctrl+Z)">
+              <Zap size={18} />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Toolbar: only in standalone mode */}
+      {!embedded && (
+        <TableToolbar
+          onSetEqual={handleSetEqualWrapper}
+          onIncrease={() => openAdjust('add')}
+          onDecrease={() => openAdjust('sub')}
+          onScale={() => openAdjust('mul')}
+          onInterpolate={handleInterpolate}
+          onSmooth={handleSmooth}
+          onRebin={() => setRebinDialog({ ...rebinDialog, show: true })}
+          onSetSize={sizeInfo?.resizable ? () => setSetSizeOpen(true) : undefined}
+          onCopy={handleCopy}
+          onPaste={handlePaste}
+          onUndo={handleUndo}
+          onRedo={handleRedo}
+          canUndo={canUndo}
+          canRedo={canRedo}
+          canPaste={true}
+          followMode={followMode}
+          onFollowModeToggle={() => setFollowMode(!followMode)}
+          yAxisBottom={yAxisBottom}
+          onYAxisBottomToggle={() => setTableYAxisBottom(!yAxisBottom)}
+          showColorShade={showColorShade}
+          onColorShadeToggle={() => setShowColorShade(!showColorShade)}
+          show3D={show3D}
+          onToggle3D={() => setShow3D(!show3D)}
+          onGenerate={generatableKind ? () => setShowGenerateDialog(true) : undefined}
+          generatableLabel={generatableKind ? generatableTableLabel(generatableKind) : undefined}
+          onImportTable={handleImportTable}
+          onExportTable={handleExportTable}
+          onAskAi={handleAskAi}
+        />
+      )}
+
+      {show3D ? (
+        <TableEditor3D
+          title={title}
+          x_bins={localXBins}
+          y_bins={localYBins}
+          z_values={localZValues}
+          x_label={x_axis_name}
+          y_label={y_axis_name}
+          onBack={() => setShow3D(false)}
+          selectedCell={selectionRange ? { x: selectionRange.start[0], y: selectionRange.start[1] } : null}
+          onCellSelect={(x, y) => setSelectionRange({ start: [x, y], end: [x, y] })}
+          heatmapScheme={heatmapSettings.valueScheme}
+        />
+      ) : (
+      <div
+        className={`editor-content${hasEmbeddedTableLiveReadout(table_name, x_output_channel, y_output_channel) ? ' editor-content--with-live' : ''}${isAfrTargetTable ? ' editor-content--with-lambda' : ''}`}
+        onContextMenu={e => {
+          // The event target is usually the inner value span, so walk up to the cell.
+          const cell = (e.target as HTMLElement).closest('.table-cell') as HTMLElement | null;
+          if (!cell) return;
+          const x = Number(cell.dataset.x);
+          const y = Number(cell.dataset.y);
+          if (!Number.isInteger(x) || !Number.isInteger(y)) return;
+          if (!localZValues[y] || localZValues[y][x] === undefined) return;
+          handleRightClick(e, x, y, cell);
+        }}
+      >
+        <TableGrid
+          x_bins={localXBins}
+          y_bins={localYBins}
+          z_values={localZValues}
+          onCellChange={handleCellChange}
+          onAxisChange={handleAxisChange}
+          selectionRange={selectionRange}
+          onSelectionChange={handleSelectionChange}
+          onCellDoubleClick={handleCellDoubleClick}
+          historyTrail={visibleHistoryTrail}
+          lockedCells={lockedCells}
+          onCellLock={handleCellLock}
+          // Live cursor - maps realtime values to table position
+          showLiveCursor={followMode && realtimeData !== undefined}
+          liveCursorX={x_output_channel ? realtimeData?.[x_output_channel] : realtimeData?.rpm}
+          liveCursorY={y_output_channel ? realtimeData?.[y_output_channel] : realtimeData?.map}
+          // Heatmap color settings
+          showColorShade={showColorShade}
+          heatmapScheme={heatmapSettings.valueScheme}
+          compact={embedded}
+          yAxisBottom={yAxisBottom}
+          fitViewport={fitVeViewport}
+        />
+        {isAfrTargetTable && (
+          <LambdaPreviewTable
+            zValues={localZValues}
+            xBins={localXBins}
+            yBins={localYBins}
+            yAxisBottom={yAxisBottom}
+          />
+        )}
+        {hasEmbeddedTableLiveReadout(table_name, x_output_channel, y_output_channel) && (
+          <TableLiveReadout
+            tableName={table_name}
+            xLabel={x_axis_name}
+            yLabel={y_axis_name}
+            xChannel={x_output_channel}
+            yChannel={y_output_channel}
+          />
+        )}
+      </div>
+      )}
+
+      <TableContextMenu
+        visible={contextMenu.visible}
+        x={contextMenu.x}
+        y={contextMenu.y}
+        cellValue={contextMenu.value}
+        position={contextMenu.position || { top: contextMenu.y, left: contextMenu.x }}
+        onClose={() => setContextMenu({ visible: false, x: 0, y: 0, value: 0 })}
+        onSetEqual={handleContextMenuSetEqual}
+        onScale={handleContextMenuScale}
+        onInterpolate={() => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleInterpolate(); }}
+        onInterpolateLinear={(axis) => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleInterpolateLinear(axis); }}
+        onSmooth={() => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleSmooth(); }}
+        onAddOffset={(offset) => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleAddOffset(offset); }}
+        onNudge={(up, large) => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleNudge(up, large); }}
+        onFill={(direction) => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleFill(direction); }}
+        onLock={() => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleCellLock(contextMenu.x, contextMenu.y, true); }}
+        onUnlock={() => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleCellLock(contextMenu.x, contextMenu.y, false); }}
+        isLocked={lockedCells.has(`${contextMenu.x},${contextMenu.y}`)}
+        onCopy={() => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handleCopy(); }}
+        onPaste={() => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); handlePaste(); }}
+        onToggleHeatmap={() => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); setShowColorShade(prev => !prev); }}
+        onGenerate={generatableKind ? () => { setContextMenu({ visible: false, x: 0, y: 0, value: 0 }); setShowGenerateDialog(true); } : undefined}
+        generatableLabel={generatableKind ? generatableTableLabel(generatableKind) : undefined}
+      />
+
+      {generatableKind && (
+        <GenerateTableDialog
+          isOpen={showGenerateDialog}
+          onClose={() => setShowGenerateDialog(false)}
+          tableName={table_name}
+          kind={generatableKind}
+          rpmBins={localXBins}
+          loadBins={localYBins}
+          onApply={handleGenerateApply}
+        />
+      )}
+
+      <RebinDialog
+        isOpen={rebinDialog.show}
+        onClose={() => setRebinDialog({ ...rebinDialog, show: false })}
+        onApply={handleRebin}
+        currentXBins={rebinDialog.newXBins}
+        currentYBins={rebinDialog.newYBins}
+        xAxisName={x_axis_name}
+        yAxisName={y_axis_name}
+      />
+
+      {sizeInfo?.resizable && (
+        <SetTableSizeDialog
+          isOpen={setSizeOpen}
+          onClose={() => setSetSizeOpen(false)}
+          onApply={handleSetTableSize}
+          isBusy={setSizeBusy}
+          limits={{
+            min_cols: sizeInfo.min_cols,
+            max_cols: sizeInfo.max_cols,
+            min_rows: sizeInfo.min_rows,
+            max_rows: sizeInfo.max_rows,
+            max_elements: sizeInfo.max_elements,
+            active_cols: sizeInfo.active_cols,
+            active_rows: sizeInfo.active_rows,
+          }}
+        />
+      )}
+
+      <CellEditDialog
+        isOpen={cellEditDialog.show}
+        onClose={() => setCellEditDialog({ ...cellEditDialog, show: false })}
+        onApply={handleCellEditApply}
+        currentValue={cellEditDialog.value}
+        cellRow={cellEditDialog.row}
+        cellCol={cellEditDialog.col}
+        xBinValue={rebinDialog.newXBins[cellEditDialog.col] ?? 0}
+        yBinValue={rebinDialog.newYBins[cellEditDialog.row] ?? 0}
+        xAxisName={x_axis_name}
+        yAxisName={y_axis_name}
+      />
+
+      <TableAdjustDialog
+        open={adjustDialog.show}
+        kind={adjustDialog.kind}
+        raw={adjustDialog.raw}
+        error={adjustDialog.error}
+        cellCount={selectedCellsCoords.length}
+        onChange={(raw) => setAdjustDialog((d) => ({ ...d, raw, error: null }))}
+        onClose={() => setAdjustDialog((d) => ({ ...d, show: false, error: null }))}
+        onApply={applyAdjust}
+      />
+    </div>
+  );
+}

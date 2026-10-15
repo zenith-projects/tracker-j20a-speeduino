@@ -1,0 +1,5337 @@
+//! Core INI file parser
+//!
+//! Handles the tokenization and section-by-section parsing of ECU INI definition files.
+
+use regex::Regex;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use super::{
+    constants::{parse_constant_line, parse_pc_variable_line},
+    gauges::parse_gauge_line,
+    output_channels::parse_output_channel_line,
+    tables::{CurveDefinition, TableDefinition},
+    types::{
+        AnalysisFilter, CalibrationGenerator, CalibrationSolution, CalibrationTableIdentifier,
+        CommandButtonCloseAction, CommandPart, ControllerCommand, DatalogEntry, DatalogView,
+        DialogComponent, DialogDefinition, EcuType, FTPBrowserConfig, FilterOperator,
+        FrontPageConfig, FrontPageIndicator, GammaEConfig, HelpTopic, IndicatorDefinition,
+        IndicatorPanel, KeyAction, LoggerDefinition, MaintainConstantValue, Menu, MenuItem,
+        PortEditorConfig, ReadoutDefinition, ReadoutPanel, ReferenceTable, SettingAssignment,
+        SettingGroup, SettingOption, SettingSelectorOption, Shape, ThermistorOption,
+        VeAnalyzeConfig, WueAnalyzeConfig,
+    },
+    EcuDefinition, IniError,
+};
+
+/// Maximum depth for nested #include directives
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+struct ParserState {
+    current_page: u8,
+    last_offset: u16,
+    current_table: Option<String>,
+    current_dialog: Option<String>,
+    current_indicator_panel: Option<String>,
+    current_readout_panel: Option<String>,
+    current_curve: Option<String>,
+    current_help: Option<String>,
+    current_reference_table: Option<String>,
+    /// Name of the `settingGroup` most recently opened in `[SettingGroups]`,
+    /// so its `settingOption` lines attach to it.
+    current_setting_group: Option<String>,
+    /// `tableLimits` rows seen in the current `referenceTable` block; applied
+    /// to its identifiers when the block closes (they may appear either side
+    /// of the `tableIdentifier` line they annotate).
+    pending_reference_limits: Vec<(u8, f64, f64, f64)>,
+}
+
+/// Context for include resolution
+struct IncludeContext {
+    /// Base directory for resolving relative paths
+    base_dir: Option<PathBuf>,
+    /// Set of already-included files (canonical paths) for circular reference detection
+    included_files: HashSet<PathBuf>,
+    /// Current include depth
+    depth: usize,
+    /// Symbols defined via #set directive (shared across includes)
+    pub defined_symbols: HashSet<String>,
+    /// Every symbol this INI actually tests in an `#if`, whether or not it was
+    /// defined. Lets a caller ask "does this file care about CELSIUS?" without
+    /// re-reading it - and so avoids prompting for a unit an INI never uses.
+    pub tested_symbols: HashSet<String>,
+}
+
+/// Preprocessor symbols every parse starts with, on top of anything the INI
+/// `#set`s itself.
+///
+/// TunerStudio seeds these from the project's `ecuSettings` line
+/// (`ecuSettings=AFR|CELSIUS|…`), which is how an INI's `#if CELSIUS` blocks
+/// select metric units. Nothing carried that into LibreTune, so the `#else`
+/// arm always won and every temperature came out in Fahrenheit while wearing
+/// the INI's generic "TEMP" label — a 23 °C cold start read 73 on the gauge.
+/// The host application sets this from its own units preference.
+static DEFAULT_SYMBOLS: std::sync::RwLock<Option<HashSet<String>>> = std::sync::RwLock::new(None);
+
+/// Replace the preprocessor symbols seeded into every subsequent parse.
+/// Call before loading a definition; affects parses started after it returns.
+pub fn set_default_symbols<I: IntoIterator<Item = String>>(symbols: I) {
+    let set: HashSet<String> = symbols.into_iter().collect();
+    if let Ok(mut guard) = DEFAULT_SYMBOLS.write() {
+        *guard = Some(set);
+    }
+}
+
+fn default_symbols() -> HashSet<String> {
+    DEFAULT_SYMBOLS
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_default()
+}
+
+impl IncludeContext {
+    fn new(base_path: Option<&Path>) -> Self {
+        Self {
+            base_dir: base_path.and_then(|p| p.parent().map(|d| d.to_path_buf())),
+            included_files: HashSet::new(),
+            depth: 0,
+            defined_symbols: default_symbols(),
+            tested_symbols: HashSet::new(),
+        }
+    }
+
+    /// Resolve an include path relative to the current file's directory
+    fn resolve_include(&self, include_path: &str) -> Option<PathBuf> {
+        let include_path = include_path.trim().trim_matches('"');
+        let path = Path::new(include_path);
+
+        if path.is_absolute() {
+            Some(path.to_path_buf())
+        } else if let Some(base) = &self.base_dir {
+            Some(base.join(path))
+        } else {
+            // No base dir, try relative to current working directory
+            Some(PathBuf::from(include_path))
+        }
+    }
+}
+
+/// Parse a complete INI file into an EcuDefinition
+pub fn parse_ini(content: &str) -> Result<EcuDefinition, IniError> {
+    let mut ctx = IncludeContext::new(None);
+    let mut def = parse_ini_internal(content, &mut ctx)?;
+    def.active_symbols = ctx.defined_symbols.clone();
+    def.tested_symbols = ctx.tested_symbols.clone();
+    Ok(def)
+}
+
+/// Parse an INI file from a path, enabling #include directive support
+pub fn parse_ini_from_path(path: &Path) -> Result<EcuDefinition, IniError> {
+    let content = read_ini_file(path)?;
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    let mut ctx = IncludeContext::new(Some(path));
+    ctx.included_files.insert(canonical);
+
+    // The symbols travel with the definition: they record which arm of every
+    // `#if` this parse took, including any the INI `#set` itself.
+    let mut def = parse_ini_internal(&content, &mut ctx)?;
+    def.active_symbols = ctx.defined_symbols.clone();
+    def.tested_symbols = ctx.tested_symbols.clone();
+    Ok(def)
+}
+
+/// Read an INI file with encoding fallback (UTF-8 first, then Windows-1252).
+///
+/// Many translated ECU INI files use Windows-1252 rather than UTF-8;
+/// see [`crate::ini::encoding`] for details.
+fn read_ini_file(path: &Path) -> Result<String, IniError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(crate::ini::encoding::decode_ini_bytes(&bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(IniError::IncludeNotFound(path.display().to_string()))
+        }
+        Err(e) => Err(IniError::IoError(e.to_string())),
+    }
+}
+
+/// Internal parsing function that handles #include directives
+fn parse_ini_internal(content: &str, ctx: &mut IncludeContext) -> Result<EcuDefinition, IniError> {
+    let mut definition = EcuDefinition::default();
+    // Raw `[LoggerDefinition]` lines, kept so the diagnostic loggers can be
+    // parsed as blocks after the line-at-a-time pass finishes.
+    let mut logger_section_lines: Vec<String> = Vec::new();
+    let mut current_section = String::new();
+    let mut state = ParserState {
+        current_page: 0,
+        last_offset: 0,
+        current_table: None,
+        current_dialog: None,
+        current_indicator_panel: None,
+        current_readout_panel: None,
+        current_curve: None,
+        current_help: None,
+        current_reference_table: None,
+        current_setting_group: None,
+        pending_reference_limits: Vec::new(),
+    };
+
+    // Preprocessor state - now shared via ctx.defined_symbols
+    let mut condition_stack: Vec<bool> = Vec::new();
+
+    // Pre-compile regex for line continuations
+    let continuation_re = Regex::new(r"\\\s*$").unwrap();
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let mut line = lines[i].to_string();
+
+        // Handle line continuations
+        while continuation_re.is_match(&line) && i + 1 < lines.len() {
+            line = continuation_re.replace(&line, "").to_string();
+            i += 1;
+            line.push_str(lines[i].trim());
+        }
+
+        let line = strip_comment(&line);
+        let line = line.trim();
+
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Handle preprocessor directives.
+        //
+        // `#set`/`#unset` only take effect in a live branch, exactly like
+        // `#define` and `#include` below. Running them unconditionally let a
+        // symbol defined inside a dead `#if` arm leak into the live one, so an
+        // INI that guards a definition behind `#if SOME_BUILD` still picked up
+        // that build's symbols.
+        if let Some(stripped) = line.strip_prefix("#set ") {
+            if condition_stack.iter().all(|&c| c) {
+                let symbol = stripped.trim().to_string();
+                tracing::debug!("preprocessor: #set {}", symbol);
+                ctx.defined_symbols.insert(symbol);
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(stripped) = line.strip_prefix("#unset ") {
+            if condition_stack.iter().all(|&c| c) {
+                let symbol = stripped.trim();
+                tracing::debug!("preprocessor: #unset {}", symbol);
+                ctx.defined_symbols.remove(symbol);
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(stripped) = line.strip_prefix("#if ") {
+            let symbol = stripped.trim();
+            let is_defined = ctx.defined_symbols.contains(symbol);
+            ctx.tested_symbols.insert(symbol.to_string());
+            tracing::debug!("preprocessor: #if {} -> {}", symbol, is_defined);
+            condition_stack.push(is_defined);
+            i += 1;
+            continue;
+        }
+
+        if line == "#else" {
+            if let Some(last) = condition_stack.last_mut() {
+                tracing::debug!("preprocessor: #else (was {}, now {})", *last, !*last);
+                *last = !*last;
+            }
+            i += 1;
+            continue;
+        }
+
+        if line == "#endif" {
+            tracing::debug!("preprocessor: #endif");
+            condition_stack.pop();
+            i += 1;
+            continue;
+        }
+
+        // Handle #define directives (only if in active branch)
+        if line.starts_with("#define") {
+            if condition_stack.iter().all(|&c| c) {
+                parse_define_directive(&mut definition, line);
+            }
+            i += 1;
+            continue;
+        }
+
+        // Handle #include directives (only if in active branch)
+        if let Some(stripped) = line.strip_prefix("#include") {
+            if condition_stack.iter().all(|&c| c) {
+                let include_path = stripped.trim().trim_matches('"');
+                if let Some(resolved_path) = ctx.resolve_include(include_path) {
+                    // Check depth limit
+                    if ctx.depth >= MAX_INCLUDE_DEPTH {
+                        return Err(IniError::IncludeDepthExceeded(MAX_INCLUDE_DEPTH));
+                    }
+
+                    // Get canonical path for circular reference detection
+                    let canonical = resolved_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| resolved_path.clone());
+
+                    // Check for circular includes
+                    if ctx.included_files.contains(&canonical) {
+                        return Err(IniError::CircularInclude(
+                            resolved_path.display().to_string(),
+                        ));
+                    }
+
+                    // Read and parse the included file
+                    let included_content = read_ini_file(&resolved_path)?;
+
+                    // Save current base_dir and update for nested includes
+                    let prev_base = ctx.base_dir.clone();
+                    ctx.base_dir = resolved_path.parent().map(|p| p.to_path_buf());
+                    ctx.included_files.insert(canonical.clone());
+                    ctx.depth += 1;
+
+                    // Parse included content and merge into current definition
+                    let included_def = parse_ini_internal(&included_content, ctx)?;
+                    merge_definitions(&mut definition, included_def);
+
+                    // Restore context
+                    ctx.base_dir = prev_base;
+                    ctx.depth -= 1;
+                    // Note: we keep canonical in included_files to prevent re-inclusion
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Skip other preprocessor directives
+        if line.starts_with('#') {
+            i += 1;
+            continue;
+        }
+
+        // Skip content if we're in a false branch
+        if !condition_stack.iter().all(|&c| c) {
+            i += 1;
+            continue;
+        }
+
+        // Check for section header
+        let line_trimmed = line.trim();
+        if line_trimmed.starts_with('[') && line_trimmed.ends_with(']') {
+            let inner = line_trimmed[1..line_trimmed.len() - 1].trim();
+
+            // Spec §A.2: conditional section header `[Name &cond1 [&cond2 ...]]`.
+            // Each `&token` is a `#define` symbol reference (optionally negated
+            // with `!`). The whole header is suppressed unless every condition
+            // evaluates true. When suppressed, `current_section` is cleared so
+            // subsequent `key = value` lines fall through to the catch-all arm.
+            let (name, conditions): (&str, Vec<&str>) = if let Some(amp) = inner.find('&') {
+                let (n, rest) = inner.split_at(amp);
+                let conds: Vec<&str> = rest
+                    .split('&')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                (n.trim(), conds)
+            } else {
+                (inner, Vec::new())
+            };
+
+            let conditions_pass = conditions.iter().all(|c| {
+                let (negated, sym) = if let Some(s) = c.strip_prefix('!') {
+                    (true, s.trim())
+                } else {
+                    (false, *c)
+                };
+                let defined = ctx.defined_symbols.contains(sym);
+                if negated {
+                    !defined
+                } else {
+                    defined
+                }
+            });
+
+            if !conditions.is_empty() && !conditions_pass {
+                tracing::debug!(
+                    "ini: section [{}] suppressed by unmet condition(s): {:?}",
+                    name,
+                    conditions
+                );
+                current_section = String::new();
+                i += 1;
+                continue;
+            }
+
+            // Spec §A.1: `[UiDialogs]` is a deprecated alias for `[UserDefined]`.
+            if name.eq_ignore_ascii_case("UiDialogs") {
+                static LOGGED_UIDIALOGS: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED_UIDIALOGS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[WARN] ini: [UiDialogs] is a deprecated alias for [UserDefined] — \
+                         please update your INI"
+                    );
+                }
+                current_section = "UserDefined".to_string();
+            } else {
+                current_section = name.to_string();
+            }
+            i += 1;
+            continue;
+        }
+
+        // Parse key = value
+        if let Some((key, value)) = parse_key_value(line) {
+            // Case-insensitive section matching for robustness
+            match current_section.to_lowercase().as_str() {
+                "megatune" => parse_megatune(&mut definition, key, value),
+                "tunerstudio" => parse_tunerstudio(&mut definition, key, value),
+                "constants" => parse_constants_entry(
+                    &mut definition,
+                    key,
+                    value,
+                    &mut state.current_page,
+                    &mut state.last_offset,
+                ),
+                "outputchannels" => parse_output_channel_entry(&mut definition, key, value),
+                "burstmode" => parse_burst_mode_entry(&mut definition, key, value),
+                "gaugeconfigurations" => parse_gauge_entry(&mut definition, key, value),
+                "settinggroups" => parse_setting_group_entry(
+                    &mut definition,
+                    key,
+                    value,
+                    &mut state.current_setting_group,
+                ),
+                "pcvariables" => parse_pc_variable_entry(&mut definition, key, value),
+                "datalog" => parse_datalog_entry(&mut definition, key, value),
+                "defaults" => parse_defaults_entry(&mut definition, key, value),
+                "menu" => parse_menu_entry(&mut definition, key, value),
+                "userdefined" => parse_user_defined_entry(
+                    &mut definition,
+                    key,
+                    value,
+                    &mut state.current_dialog,
+                    &mut state.current_indicator_panel,
+                    &mut state.current_readout_panel,
+                    &mut state.current_help,
+                ),
+                "settingcontexthelp" => parse_setting_context_help(&mut definition, key, value),
+                "frontpage" => parse_frontpage_entry(&mut definition, key, value),
+                "controllercommands" => parse_controller_command_entry(&mut definition, key, value),
+                "loggerdefinition" => {
+                    // Keep the raw line too: diagnostic loggers are BLOCKS
+                    // (a `loggerDef` opens one, indented keys follow), which
+                    // the line-at-a-time dispatch cannot represent.
+                    logger_section_lines.push(line.to_string());
+                    parse_logger_definition_entry(&mut definition, key, value)
+                }
+                "porteditor" => parse_port_editor_entry(&mut definition, key, value),
+                "referencetables" => parse_reference_table_entry(
+                    &mut definition,
+                    key,
+                    value,
+                    &mut state.current_reference_table,
+                    &mut state.pending_reference_limits,
+                ),
+                "ftpbrowser" => parse_ftp_browser_entry(&mut definition, key, value),
+                "datalogviews" => parse_datalog_view_entry(&mut definition, key, value),
+                "keyactions" => parse_key_action_entry(&mut definition, key, value),
+                "veanalyze" => parse_ve_analyze_entry(&mut definition, key, value),
+                "wueanalyze" => parse_wue_analyze_entry(&mut definition, key, value),
+                "gammae" => parse_gamma_e_entry(&mut definition, key, value),
+                "constantsextensions" => {
+                    parse_constants_extensions_entry(&mut definition, key, value)
+                }
+                _ => {
+                    // Startswith / contains checks (keeping case-sensitive or making insensitive?)
+                    // For now, let's keep these checks against the original string or lowercase?
+                    // "TableEditor" logic:
+                    let section_lower = current_section.to_lowercase();
+                    if section_lower.contains("tableeditor") {
+                        parse_table_editor_entry(
+                            &mut definition,
+                            key,
+                            value,
+                            &mut state.current_table,
+                        );
+                    } else if section_lower.contains("curveeditor") {
+                        parse_curve_editor_entry(
+                            &mut definition,
+                            key,
+                            value,
+                            &mut state.current_curve,
+                        );
+                    } else if !current_section.is_empty()
+                        && !is_known_passive_section(&section_lower)
+                    {
+                        // Spec §14: warn once per truly-unknown section name so users
+                        // notice INI grammar gaps without flooding the log.
+                        warn_unknown_section(&current_section);
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    // The last `referenceTable` block has no successor to close it.
+    apply_pending_reference_limits(
+        &mut definition,
+        &state.current_reference_table,
+        &mut state.pending_reference_limits,
+    );
+
+    // Post-process: Apply variable substitution to commands that may have been parsed
+    // before [PcVariables] section was encountered (e.g., queryCommand in [MegaTune])
+    post_process_variable_substitution(&mut definition);
+
+    // Post-process menu items to fix types that couldn't be determined during initial parse
+    // (e.g., help topics defined after menu section)
+    post_process_menu_items(&mut definition);
+
+    // Resolve allocated sizes for TunerStudio dynamically sized arrays, then
+    // fill table x_size/y_size (defaults / allocated) from those constants.
+    post_process_dynamic_shapes(&mut definition);
+    post_process_table_sizes(&mut definition);
+
+    // Detect ECU type from signature
+    definition.ecu_type = EcuType::detect(
+        &definition.signature,
+        ctx.base_dir
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str()),
+    );
+
+    // Roles are declared by `[VeAnalyze]`/`[WueAnalyze]`, which may sit in any
+    // file of an include tree, so they can only be resolved once everything has
+    // been merged. `depth == 0` is the outermost parse; nested calls are
+    // include files still being folded into it.
+    //
+    // Doing it here rather than in each entry point means a caller cannot
+    // forget: `infer_table_roles()` already existed and was correct, but
+    // nothing ever called it, so every table kept `TableRole::Other`.
+    if ctx.depth == 0 {
+        definition.infer_table_roles();
+    }
+    // Envelope byte order stays at the big-endian msEnvelope_1.0 default.
+    //
+    // This previously forced little-endian for Speeduino, reasoning from a
+    // comms.cpp comment ("TS comms is little-endian"). Real hardware says
+    // otherwise: a Speeduino 2025.01.4 on a Mega2560 answered the CRC
+    // handshake only after the byte order was flipped to BigEndian, and its
+    // replies frame the length big-endian (`00 01 | rc | crc32`). The comment
+    // describes the ECU's internal representation, not the wire envelope. The
+    // handshake's flip-retry still covers a firmware that genuinely differs.
+
+    // Diagnostic loggers, parsed as blocks from the raw section text. Doing it
+    // here rather than per-line is what lets a `loggerDef` own the indented
+    // keys that follow it.
+    if !logger_section_lines.is_empty() {
+        let refs: Vec<&str> = logger_section_lines.iter().map(String::as_str).collect();
+        definition.diagnostic_loggers =
+            crate::ini::diagnostic_logger::parse_logger_definitions(&refs);
+    }
+
+    Ok(definition)
+}
+
+/// Merge an included definition into the main definition
+/// Later definitions override earlier ones for matching keys
+fn merge_definitions(target: &mut EcuDefinition, source: EcuDefinition) {
+    // Merge defines (source overrides)
+    target.defines.extend(source.defines);
+
+    // Merge constants (source overrides)
+    target.constants.extend(source.constants);
+
+    // Merge output channels
+    target.output_channels.extend(source.output_channels);
+
+    // Merge tables
+    target.tables.extend(source.tables);
+    target.table_map_to_name.extend(source.table_map_to_name);
+
+    // Merge curves
+    target.curves.extend(source.curves);
+
+    // Merge gauges
+    target.gauges.extend(source.gauges);
+
+    // Merge setting groups
+    target.setting_groups.extend(source.setting_groups);
+
+    // Merge dialogs
+    target.dialogs.extend(source.dialogs);
+
+    // Merge menus (append)
+    target.menus.extend(source.menus);
+
+    // Merge help topics
+    target.help_topics.extend(source.help_topics);
+
+    // Merge datalog entries (append)
+    target.datalog_entries.extend(source.datalog_entries);
+
+    // Merge PC variables
+    target.pc_variables.extend(source.pc_variables);
+
+    // Merge default values
+    target.default_values.extend(source.default_values);
+    target.maximum_elements.extend(source.maximum_elements);
+
+    // Merge indicator panels
+    target.indicator_panels.extend(source.indicator_panels);
+
+    // Merge readout panels
+    target.readout_panels.extend(source.readout_panels);
+
+    // Merge controller commands
+    target
+        .controller_commands
+        .extend(source.controller_commands);
+
+    // Merge logger definitions
+    target.logger_definitions.extend(source.logger_definitions);
+
+    // Merge port editors
+    target.port_editors.extend(source.port_editors);
+
+    // Merge reference tables
+    target.reference_tables.extend(source.reference_tables);
+
+    // Merge FTP browsers
+    target.ftp_browsers.extend(source.ftp_browsers);
+
+    // Merge datalog views
+    target.datalog_views.extend(source.datalog_views);
+
+    // Merge key actions (append)
+    target.key_actions.extend(source.key_actions);
+
+    // Take frontpage from source if target doesn't have one
+    if target.frontpage.is_none() && source.frontpage.is_some() {
+        target.frontpage = source.frontpage;
+    }
+
+    // For scalar values, only take from source if they appear to be set
+    // (non-default values override)
+    if !source.signature.is_empty() {
+        target.signature = source.signature;
+    }
+    if !source.query_command.is_empty() {
+        target.query_command = source.query_command;
+    }
+    if !source.version_info.is_empty() {
+        target.version_info = source.version_info;
+    }
+    if !source.page_sizes.is_empty() {
+        target.page_sizes = source.page_sizes;
+    }
+    if source.n_pages > 0 {
+        target.n_pages = source.n_pages;
+    }
+
+    // Merge analysis configs (source overrides target)
+    if source.ve_analyze.is_some() {
+        target.ve_analyze = source.ve_analyze;
+    }
+    if source.wue_analyze.is_some() {
+        target.wue_analyze = source.wue_analyze;
+    }
+    if source.gamma_e.is_some() {
+        target.gamma_e = source.gamma_e;
+    }
+
+    // Merge ConstantsExtensions (append)
+    target
+        .maintain_constant_values
+        .extend(source.maintain_constant_values);
+    target
+        .requires_power_cycle
+        .extend(source.requires_power_cycle);
+}
+
+/// Strip comments from a line (everything after ';')
+/// Note: '#' is handled at the line level for preprocessor directives
+/// Special case: Don't strip semicolons in field names before '=' (for help text syntax)
+fn strip_comment(line: &str) -> String {
+    // A line whose first non-whitespace character is ';' is a comment in its
+    // entirety, including commented-out properties like ";name = value".
+    // The help-text branch below intentionally keeps semicolons that appear
+    // before '=', but that syntax is "fieldname;+help" — it always has a field
+    // name in front. Without this guard a commented-out property survives
+    // stripping and is parsed as a real entry whose name is the empty string
+    // (extract_help_text slices [..0]). In the stock Speeduino INI that turns
+    // 148 commented-out lines into live properties, and writes a junk
+    // <entry name=""/> into every saved tune's constant manifest.
+    if line.trim_start().starts_with(';') {
+        return String::new();
+    }
+
+    // First pass: Check if line contains '=' (outside quotes)
+    // This allows us to distinguish between properties (key=val) and other lines (headers, directives)
+    let mut has_equals = false;
+    let mut in_quotes_scan = false;
+    for ch in line.chars() {
+        if ch == '"' {
+            in_quotes_scan = !in_quotes_scan;
+        } else if ch == '=' && !in_quotes_scan {
+            has_equals = true;
+            break;
+        }
+    }
+
+    let mut result = String::new();
+    let mut in_quotes = false;
+    let mut found_equals = false;
+
+    for ch in line.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            result.push(ch);
+        } else if ch == '=' && !in_quotes {
+            found_equals = true;
+            result.push(ch);
+        } else if ch == ';' && !in_quotes {
+            if has_equals {
+                // For property lines (with '='), only strip comments AFTER the '=' sign
+                // This preserves help text syntax: fieldname;+help = value
+                if found_equals {
+                    break;
+                } else {
+                    result.push(ch);
+                }
+            } else {
+                // For lines without '=' (e.g. section headers [Section] ; comment),
+                // strip from the first semicolon
+                break;
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
+/// Parse an INI boolean value. Accepts: `true`/`false`, `1`/`0`, `on`/`off`,
+/// `yes`/`no` (case-insensitive). Inline `;`-comments are stripped.
+fn parse_ini_bool(value: &str) -> bool {
+    let clean = value.split(';').next().unwrap_or("").trim().to_lowercase();
+    matches!(clean.as_str(), "true" | "1" | "on" | "yes")
+}
+
+/// Sections from the TunerStudio INI grammar that LibreTune deliberately accepts
+/// without parsing the body (spec §14). Returning `true` here suppresses the
+/// "unknown section" warning for these well-known names so users only see
+/// genuinely unrecognized headers.
+fn is_known_passive_section(section_lower: &str) -> bool {
+    matches!(
+        section_lower,
+        "file_header"
+            | "verbiageoverride"
+            | "turbobaud"
+            | "replay"
+            | "extendedreplay"
+            | "accelerationwizard"
+            | "encodeddata"
+            | "tuningviews"
+            | "eventtriggers"
+            | "tools"
+    )
+}
+
+/// Emit a one-time warning per unknown INI section name. Subsequent occurrences
+/// of the same section name (case-insensitive) are suppressed to avoid log
+/// flooding when an INI defines many keys under an unsupported header.
+fn warn_unknown_section(section: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let lock = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut seen) = lock.lock() {
+        let key = section.to_lowercase();
+        if seen.insert(key) {
+            eprintln!(
+                "[WARN] ini: unknown section [{section}] — entries dropped (open an issue if this should be supported)"
+            );
+        }
+    }
+}
+
+/// Extract help text from constant name according to TunerStudio format
+/// Format: fieldname;+help text;"units"
+/// Returns (clean_name, Option<help_text>)
+fn extract_help_text(name_with_help: &str) -> (&str, Option<String>) {
+    // Look for semicolon in the name part (before '=' sign)
+    if let Some(semicolon_pos) = name_with_help.find(';') {
+        let name = name_with_help[..semicolon_pos].trim();
+        let help_part = name_with_help[semicolon_pos + 1..].trim();
+
+        // TunerStudio requires '+' after semicolon for tooltip to appear
+        if let Some(help_text) = help_part.strip_prefix('+') {
+            // Extract help text (everything after '+' up to optional quoted units)
+            let help_text = help_text.trim();
+
+            // Remove quoted units suffix if present (e.g., ;"Ohm" at the end)
+            let help_clean = if let Some(quote_pos) = help_text.find(';') {
+                help_text[..quote_pos].trim()
+            } else {
+                help_text
+            };
+
+            // Remove surrounding quotes if present
+            let help_final = help_clean.trim_matches('"').to_string();
+
+            if !help_final.is_empty() {
+                return (name, Some(help_final));
+            }
+        }
+
+        // If semicolon exists but no '+' prefix, return just the name (no help text)
+        return (name, None);
+    }
+
+    (name_with_help.trim(), None)
+}
+
+/// Parse a key = value line
+fn parse_key_value(line: &str) -> Option<(&str, &str)> {
+    let parts: Vec<&str> = line.splitn(2, '=').collect();
+    if parts.len() == 2 {
+        Some((parts[0].trim(), parts[1].trim()))
+    } else {
+        None
+    }
+}
+
+pub use super::split_ini_line;
+
+/// Parse a #define directive
+/// Format: #define name = value1, value2, value3
+/// These are used to define option lists for bits fields, and can reference
+/// other defines using $referenceName syntax.
+fn parse_define_directive(def: &mut EcuDefinition, line: &str) {
+    // Format: #define name = value1, value2, ...
+    // Or:     #define = name = value1, value2, ...
+    let content = line.strip_prefix("#define").unwrap_or(line).trim();
+
+    // Handle both "name = values" and "= name = values" formats
+    let content = content
+        .strip_prefix('=')
+        .map(|s| s.trim())
+        .unwrap_or(content);
+
+    if let Some((name, values_str)) = parse_key_value(content) {
+        let values: Vec<String> = split_ini_line(values_str)
+            .into_iter()
+            .flat_map(|v| {
+                let v = v.trim().trim_matches('"').to_string();
+                // Resolve $references to other defines
+                if let Some(ref_name) = v.strip_prefix('$') {
+                    def.defines
+                        .get(ref_name)
+                        .cloned()
+                        .unwrap_or_else(|| vec![v])
+                } else if !v.is_empty() {
+                    vec![v]
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+
+        if !name.is_empty() && !values.is_empty() {
+            def.defines.insert(name.to_string(), values);
+        }
+    }
+}
+
+/// Resolve bits field option values, expanding $references to defines
+fn resolve_bits_options(
+    defines: &std::collections::HashMap<String, Vec<String>>,
+    options: Vec<String>,
+) -> Vec<String> {
+    options
+        .into_iter()
+        .flat_map(|v| {
+            let v = v.trim().trim_matches('"').to_string();
+            if let Some(ref_name) = v.strip_prefix('$') {
+                defines.get(ref_name).cloned().unwrap_or_else(|| vec![v])
+            } else if !v.is_empty() {
+                vec![v]
+            } else {
+                vec![]
+            }
+        })
+        .collect()
+}
+
+/// Parse [MegaTune] section entries
+fn parse_megatune(def: &mut EcuDefinition, key: &str, value: &str) {
+    match key.to_lowercase().as_str() {
+        "signature" => {
+            def.signature = value.trim_matches('"').to_string();
+        }
+        "signatureprefix" => {
+            def.signature_prefix = Some(value.trim_matches('"').to_string());
+        }
+        "querycommand" => {
+            tracing::debug!("parse_megatune: queryCommand = {:?}", value);
+            def.query_command = value.trim_matches('"').to_string();
+        }
+        "versioninfo" => {
+            def.version_info = value.trim_matches('"').to_string();
+        }
+        "delayafterportopen" => {
+            // Strip potential comments
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.delay_after_port_open = clean_val.parse().unwrap_or(0);
+            tracing::debug!(
+                "parse_megatune: delayAfterPortOpen = {}",
+                def.protocol.delay_after_port_open
+            );
+        }
+        "interwritedelay" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.inter_write_delay = clean_val.parse().unwrap_or(0);
+        }
+        "pageactivationdelay" | "pageactivationdelayms" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.page_activation_delay = clean_val.parse().unwrap_or(500);
+        }
+        "ochgetcommand" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.och_get_command = Some(clean_val.trim_matches('"').to_string());
+        }
+        "ochblocksize" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.och_block_size = clean_val.parse().unwrap_or(0);
+            tracing::debug!(
+                "parse_megatune: ochBlockSize = {}",
+                def.protocol.och_block_size
+            );
+        }
+        "maxunusedruntimerange" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.max_unused_runtime_range = clean_val.parse().unwrap_or(0);
+        }
+        _ => {}
+    }
+}
+
+/// Parse [TunerStudio] section entries (INI section name - keep as-is)
+fn parse_tunerstudio(def: &mut EcuDefinition, key: &str, value: &str) {
+    tracing::debug!("parse_ts: key = {:?}, value = {:?}", key, value);
+    match key.to_lowercase().as_str() {
+        "signature" => {
+            def.signature = value.trim_matches('"').to_string();
+        }
+        "signatureprefix" => {
+            def.signature_prefix = Some(value.trim_matches('"').to_string());
+        }
+        "inispecversion" => {
+            let raw = value.trim_matches('"').trim();
+            def.ini_spec_version = raw.to_string();
+            // Spec §14.2: LibreTune currently implements iniSpecVersion ≤ 14.
+            // Versions above the cap may use grammar features we don't yet honor.
+            if let Ok(v) = raw.split(';').next().unwrap_or(raw).trim().parse::<f32>() {
+                const INI_SPEC_VERSION_CAP: f32 = 14.0;
+                if v > INI_SPEC_VERSION_CAP {
+                    eprintln!(
+                        "[WARN] ini: iniSpecVersion={} exceeds supported cap {} — \
+                         unsupported features may be silently ignored",
+                        v, INI_SPEC_VERSION_CAP
+                    );
+                }
+            }
+        }
+        "pagesizes" | "pagesize" => {
+            // Parse comma-separated page sizes
+            let sizes: Vec<u32> = value
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            def.page_sizes = sizes.iter().map(|&s| s as u16).collect();
+            def.protocol.page_sizes = sizes;
+            def.n_pages = def.page_sizes.len() as u8;
+        }
+        "npages" | "numpages" => {
+            def.n_pages = value.parse().unwrap_or(0);
+        }
+        "endianness" => {
+            if value.to_lowercase().contains("little") {
+                def.endianness = super::types::Endianness::Little;
+            } else {
+                def.endianness = super::types::Endianness::Big;
+            }
+        }
+        "querycommand" => {
+            def.query_command = value.trim_matches('"').to_string();
+            def.protocol.query_command = def.query_command.clone();
+        }
+        "defaultipaddress" => {
+            def.protocol.default_ip_address = Some(value.trim_matches('"').to_string());
+        }
+        "defaultipport" => {
+            def.protocol.default_ip_port = value.parse().unwrap_or(29001);
+        }
+        "delayafterportopen" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.delay_after_port_open = clean_val.parse().unwrap_or(0);
+            tracing::debug!(
+                "parse_ts: delayAfterPortOpen = {}",
+                def.protocol.delay_after_port_open
+            );
+        }
+        "interwritedelay" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.inter_write_delay = clean_val.parse().unwrap_or(0);
+        }
+        "pageactivationdelay" | "pageactivationdelayms" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.page_activation_delay = clean_val.parse().unwrap_or(500);
+        }
+        "messageenvelopeformat" => {
+            def.protocol.message_envelope_format = Some(value.trim_matches('"').to_string());
+            tracing::debug!(
+                "parse_ts: messageEnvelopeFormat = {:?}",
+                def.protocol.message_envelope_format
+            );
+        }
+        "maxunusedruntimerange" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.max_unused_runtime_range = clean_val.parse().unwrap_or(0);
+            tracing::debug!(
+                "parse_ts: maxUnusedRuntimeRange = {}",
+                def.protocol.max_unused_runtime_range
+            );
+        }
+        "ochgetcommand" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.och_get_command = Some(clean_val.trim_matches('"').to_string());
+            tracing::debug!(
+                "parse_ts: ochGetCommand = {:?}",
+                def.protocol.och_get_command
+            );
+        }
+        "ochblocksize" => {
+            let clean_val = value.split(';').next().unwrap_or("").trim();
+            def.protocol.och_block_size = clean_val.parse().unwrap_or(0);
+            tracing::debug!("parse_ts: ochBlockSize = {}", def.protocol.och_block_size);
+        }
+        _ => {}
+    }
+}
+
+/// Parse [Constants] section entries
+fn parse_constants_entry(
+    def: &mut EcuDefinition,
+    key: &str,
+    value: &str,
+    current_page: &mut u8,
+    last_offset: &mut u16,
+) {
+    let key_lower = key.to_lowercase();
+
+    // Check for page directive
+    // INI files use 1-based page numbers (page = 1), but MSQ files and internal cache use 0-based
+    // Normalize to 0-based for consistent internal representation
+    if key_lower == "page" {
+        let ini_page: u8 = value.parse().unwrap_or(1);
+        *current_page = ini_page.saturating_sub(1); // Convert 1-based to 0-based
+        *last_offset = 0; // Reset offset counter for new page
+        return;
+    }
+
+    // Check for protocol settings that appear in [Constants] section
+    match key_lower.as_str() {
+        "messageenvelopeformat" => {
+            def.protocol.message_envelope_format = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "maxunusedruntimerange" => {
+            def.protocol.max_unused_runtime_range = value.parse().unwrap_or(0);
+            tracing::debug!(
+                "parse_constants: maxUnusedRuntimeRange = {}",
+                def.protocol.max_unused_runtime_range
+            );
+            return;
+        }
+        "endianness" => {
+            if value.to_lowercase().contains("little") {
+                def.endianness = super::types::Endianness::Little;
+            } else {
+                def.endianness = super::types::Endianness::Big;
+            }
+            return;
+        }
+        "npages" => {
+            def.n_pages = value.parse().unwrap_or(0);
+            return;
+        }
+        "pagesize" => {
+            let sizes: Vec<u32> = value
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            def.page_sizes = sizes.iter().map(|&s| s as u16).collect();
+            def.protocol.page_sizes = sizes;
+            def.n_pages = def.page_sizes.len() as u8;
+            return;
+        }
+        "pageidentifier" => {
+            // Parse page identifiers like "\x00\x00", "\x00\x01"
+            // Also handles $tsCanId substitution
+            def.protocol.page_identifiers_raw = split_ini_line(value)
+                .into_iter()
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .collect();
+            def.protocol.page_identifiers = parse_page_identifiers(value, &def.pc_variables);
+            return;
+        }
+        "pagereadcommand" => {
+            def.protocol.page_read_commands = parse_command_list(value, &def.pc_variables);
+            return;
+        }
+        "pagevaluewrite" | "pagechunkwrite" => {
+            def.protocol.page_chunk_write_commands = parse_command_list(value, &def.pc_variables);
+            return;
+        }
+        "burncommand" => {
+            def.protocol.burn_commands = parse_command_list(value, &def.pc_variables);
+            return;
+        }
+        "crc32checkcommand" => {
+            def.protocol.crc32_check_commands = parse_command_list(value, &def.pc_variables);
+            return;
+        }
+        "retrieveconfigerror" => {
+            def.protocol.retrieve_config_error = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "pageactivationdelay" => {
+            def.protocol.page_activation_delay = value.parse().unwrap_or(500);
+            return;
+        }
+        "blockingfactor" => {
+            // Strip inline comments before parsing (e.g. "1350 ; max chunk size")
+            let clean = value.split(';').next().unwrap_or("").trim();
+            def.protocol.blocking_factor = clean.parse().unwrap_or(256);
+            return;
+        }
+        "interwritedelay" => {
+            let clean = value.split(';').next().unwrap_or("").trim();
+            def.protocol.inter_write_delay = clean.parse().unwrap_or(0);
+            return;
+        }
+        "blockreadtimeout" => {
+            let clean = value.split(';').next().unwrap_or("").trim();
+            def.protocol.block_read_timeout = clean.parse().unwrap_or(1000);
+            return;
+        }
+        // Speeduino's INI declares this inside [Constants], but only the
+        // [MegaTune]/[TunerStudio] parsers had an arm for it, so the value fell
+        // through to the generic constant parser and `delay_after_port_open`
+        // silently kept its 0 default. The handshake then raced the port open by
+        // ~24 ms instead of waiting the declared 1000 ms.
+        "delayafterportopen" => {
+            let clean = value.split(';').next().unwrap_or("").trim();
+            def.protocol.delay_after_port_open = clean.parse().unwrap_or(0);
+            return;
+        }
+        // Same section-scope gap, plus the key here is `tsWriteBlocks`; the
+        // existing arm only matched the bare `writeBlocks` spelling.
+        "writeblocks" | "tswriteblocks" => {
+            def.protocol.write_blocks =
+                value.to_lowercase() == "on" || value == "1" || value.to_lowercase() == "true";
+            return;
+        }
+        "enable2ndbytecanid" => {
+            def.protocol.enable_can_id = value.to_lowercase() != "false" && value != "0";
+            return;
+        }
+        // ---- Optional spec keys (msEnvelope_1.0 §B.1). Parsed for INI fidelity;
+        // most are not yet honored by the runtime but stored on ProtocolSettings
+        // so future code can opt in without a second migration.
+        "tablewritecommand" => {
+            def.protocol.table_write_command = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "tablecrccommand" => {
+            def.protocol.table_crc_command = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "tableblockingfactor" => {
+            let clean = value.split(';').next().unwrap_or("").trim();
+            def.protocol.table_blocking_factor = clean.parse().ok();
+            return;
+        }
+        "replayconfigtable" => {
+            def.protocol.replay_config_table = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "replayreadcommand" => {
+            def.protocol.replay_read_command = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "replayrecordcountparam" => {
+            def.protocol.replay_record_count_param = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "nocommreaddelay" => {
+            let clean = value.split(';').next().unwrap_or("").trim();
+            def.protocol.no_comm_read_delay = clean.parse().unwrap_or(0);
+            return;
+        }
+        "refreshlocalstoreonactivity" => {
+            def.protocol.refresh_local_store_on_activity = parse_ini_bool(value);
+            return;
+        }
+        "defaultruntimerecordpersec" => {
+            let clean = value.split(';').next().unwrap_or("").trim();
+            def.protocol.default_runtime_record_per_sec = clean.parse().ok();
+            return;
+        }
+        "restrictsquirtrelationship" => {
+            def.protocol.restrict_squirt_relationship = parse_ini_bool(value);
+            return;
+        }
+        "forcebigendianprotocol" => {
+            def.protocol.force_big_endian_protocol = parse_ini_bool(value);
+            return;
+        }
+        "uselegacyftempunits" => {
+            def.protocol.use_legacy_f_temp_units = parse_ini_bool(value);
+            return;
+        }
+        // Spec spells the key with the typo `surpressConfigErrorVerbiage`.
+        "surpressconfigerrorverbiage" | "suppressconfigerrorverbiage" => {
+            def.protocol.suppress_config_error_verbiage = parse_ini_bool(value);
+            return;
+        }
+        "validatearraybounds" => {
+            def.protocol.validate_array_bounds = parse_ini_bool(value);
+            return;
+        }
+        "ignoremissingbitoptions" => {
+            def.protocol.ignore_missing_bit_options = parse_ini_bool(value);
+            return;
+        }
+        "filterechobytes" => {
+            def.protocol.filter_echo_bytes = parse_ini_bool(value);
+            return;
+        }
+        "envelopedscancommands" => {
+            def.protocol.enveloped_scan_commands = parse_ini_bool(value);
+            return;
+        }
+        "pageactivate" => {
+            def.protocol.page_activate_commands = parse_command_list(value, &def.pc_variables);
+            return;
+        }
+        "defaultipaddress" => {
+            def.protocol.default_ip_address = Some(value.trim_matches('"').to_string());
+            return;
+        }
+        "defaultipport" => {
+            let clean = value.split(';').next().unwrap_or("").trim();
+            if let Ok(p) = clean.parse() {
+                def.protocol.default_ip_port = p;
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Parse constant definition, passing defines for bits options resolution
+    // Extract help text from the key (fieldname;+help text)
+    let (clean_key, help_text) = extract_help_text(key);
+
+    if let Some(mut constant) =
+        parse_constant_line(clean_key, value, *current_page, *last_offset, help_text)
+    {
+        // Record this constant's own offset so a following `lastOffset` field
+        // resolves to it. TunerStudio's `lastOffset` keyword means "reuse the
+        // previous variable's offset" -- its purpose is overlaying two scalings
+        // on the same bytes (e.g. an AFR view and a Lambda view of one fuel
+        // target: `afrTable`/`lambdaTable`, `ego_min_afr`/`ego_min_lambda`).
+        // It must NOT advance by the field's size; doing so aliased Speeduino's
+        // `afrTable` onto `rpmBinsAFR` (both at offset 256 on page 5) and read
+        // past the page end.
+        *last_offset = constant.offset;
+
+        // Resolve $references in bit_options
+        if !constant.bit_options.is_empty() {
+            constant.bit_options = resolve_bits_options(&def.defines, constant.bit_options);
+        }
+        def.constants.insert(clean_key.to_string(), constant);
+    }
+}
+
+/// Parse a comma-separated list of command format strings
+/// Applies variable substitution for $varName references
+fn parse_command_list(
+    value: &str,
+    pc_variables: &std::collections::HashMap<String, u8>,
+) -> Vec<String> {
+    split_ini_line(value)
+        .into_iter()
+        .map(|s| {
+            let s = s.trim().trim_matches('"').to_string();
+            substitute_variables(&s, pc_variables)
+        })
+        .collect()
+}
+
+/// Parse page identifiers from INI format
+/// e.g., "\x00\x00", "\x00\x01" -> [[0,0], [0,1]]
+/// Also handles $variable substitution (e.g., $tsCanId -> 0x00)
+fn parse_page_identifiers(
+    value: &str,
+    pc_variables: &std::collections::HashMap<String, u8>,
+) -> Vec<Vec<u8>> {
+    split_ini_line(value)
+        .into_iter()
+        .map(|s| {
+            let s = s.trim().trim_matches('"');
+            let substituted = substitute_variables(s, pc_variables);
+            parse_escape_sequence(&substituted)
+        })
+        .collect()
+}
+
+/// Parse escape sequences like \x00 into bytes
+fn parse_escape_sequence(s: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            match chars[i + 1] {
+                'x' | 'X' if i + 3 < chars.len() => {
+                    // Parse \xNN hex byte
+                    let hex: String = chars[i + 2..i + 4].iter().collect();
+                    if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                        bytes.push(b);
+                    }
+                    i += 4;
+                }
+                '0' => {
+                    bytes.push(0);
+                    i += 2;
+                }
+                'n' => {
+                    bytes.push(b'\n');
+                    i += 2;
+                }
+                'r' => {
+                    bytes.push(b'\r');
+                    i += 2;
+                }
+                '\\' => {
+                    bytes.push(b'\\');
+                    i += 2;
+                }
+                _ => {
+                    bytes.push(chars[i] as u8);
+                    i += 1;
+                }
+            }
+        } else {
+            bytes.push(chars[i] as u8);
+            i += 1;
+        }
+    }
+
+    bytes
+}
+
+/// Parse [OutputChannels] section entries
+fn parse_output_channel_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let key_lower = key.to_lowercase();
+
+    // Handle metadata entries
+    if key_lower == "ochblocksize" {
+        let clean_val = value.split(';').next().unwrap_or("").trim();
+        def.protocol.och_block_size = clean_val.parse().unwrap_or(0);
+        return;
+    }
+    if key_lower == "ochgetcommand" {
+        let clean_val = value.split(';').next().unwrap_or("").trim();
+        def.protocol.och_get_command = Some(clean_val.trim_matches('"').to_string());
+        return;
+    }
+
+    if let Some(mut channel) = parse_output_channel_line(key, value) {
+        // Cache parsed expression AST for computed channels (avoids reparsing every realtime update)
+        channel.cache_expression();
+        def.output_channels.insert(key.to_string(), channel);
+    }
+}
+
+/// Parse [BurstMode] section entries
+fn parse_burst_mode_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    if key.eq_ignore_ascii_case("getcommand") {
+        def.protocol.burst_get_command = Some(value.trim_matches('"').to_string());
+    } else if key.eq_ignore_ascii_case("ochgetcommand") {
+        let clean = value.trim_matches('"').to_string();
+        tracing::debug!("parse_burst_mode_entry: ochGetCommand = {:?}", clean);
+        def.protocol.och_get_command = Some(clean);
+    } else if key.eq_ignore_ascii_case("ochblocksize") {
+        let clean = value.split(';').next().unwrap_or("").trim();
+        def.protocol.och_block_size = clean.parse().unwrap_or(0);
+        tracing::debug!(
+            "parse_burst_mode_entry: ochBlockSize = {}",
+            def.protocol.och_block_size
+        );
+    }
+}
+
+/// Parse [GaugeConfigurations] section entries
+fn parse_gauge_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    if let Some(gauge) = parse_gauge_line(key, value) {
+        def.gauges.insert(key.to_string(), gauge);
+    }
+}
+
+/// Parse [SettingGroups] section entries
+fn parse_setting_group_entry(
+    def: &mut EcuDefinition,
+    key: &str,
+    value: &str,
+    current_group: &mut Option<String>,
+) {
+    if key.eq_ignore_ascii_case("settinggroup") {
+        // Format: settingGroup = refName, "Display Name"
+        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+            let group = SettingGroup {
+                name: parts[0].to_string(),
+                label: parts[1].trim_matches('"').to_string(),
+                options: Vec::new(),
+            };
+            def.setting_groups.insert(parts[0].to_string(), group);
+            *current_group = Some(parts[0].to_string());
+        }
+    } else if key.eq_ignore_ascii_case("settingoption") {
+        // Format: settingOption = value, "Display Label"
+        // These belong to the settingGroup line above them.
+        //
+        // This used to push onto `setting_groups.iter_mut().last()`, but
+        // `setting_groups` is a `HashMap` whose iteration order is seeded per
+        // instance, so every option landed in an arbitrary group.
+        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+            let option = SettingOption {
+                value: parts[0].to_string(),
+                label: parts[1].trim_matches('"').to_string(),
+            };
+            if let Some(group) = current_group
+                .as_ref()
+                .and_then(|name| def.setting_groups.get_mut(name))
+            {
+                group.options.push(option);
+            } else {
+                tracing::warn!(
+                    "ini: settingOption '{}' before any settingGroup - dropped",
+                    option.value
+                );
+            }
+        }
+    }
+}
+
+/// Parse [PcVariables] section entries
+/// These are PC-side variables like tsCanId, rpmwarn, etc.
+/// They are stored locally, not on the ECU.
+fn parse_pc_variable_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    // Extract help text from the key (fieldname;+help text)
+    let (clean_key, help_text) = extract_help_text(key);
+
+    // Parse as a full constant for UI display
+    if let Some(constant) = parse_pc_variable_line(clean_key, value, help_text) {
+        // Store as a constant so dialogs can look it up
+        def.constants.insert(clean_key.to_string(), constant);
+    }
+
+    // Also store byte value for command substitution (backward compatibility)
+    let parts = split_ini_line(value);
+    if parts.is_empty() {
+        return;
+    }
+
+    let type_str = parts[0].trim().to_uppercase();
+    if type_str == "BITS"
+        || type_str == "SCALAR"
+        || type_str == "U08"
+        || type_str == "S08"
+        || type_str == "U16"
+        || type_str == "S16"
+    {
+        def.pc_variables.insert(
+            clean_key.to_string(),
+            resolve_pc_variable_byte(def, clean_key),
+        );
+    }
+}
+
+/// Byte value a `$varName` reference resolves to.
+///
+/// This used to be a hard-coded `0`, so a board configured with a non-zero
+/// `tsCanId` had every `pageIdentifier` / `pageReadCommand` frame addressed to
+/// CAN id 0. The chain mirrors what the UI shows for the same variable
+/// (`commands/tune_io.rs`): the INI's declared default first, then the
+/// constant's declared minimum.
+fn resolve_pc_variable_byte(def: &EcuDefinition, name: &str) -> u8 {
+    def.default_values
+        .get(name)
+        .map(|v| v.clamp(0.0, u8::MAX as f64) as u8)
+        .or_else(|| {
+            def.constants
+                .get(name)
+                .map(|c| c.min.clamp(0.0, u8::MAX as f64) as u8)
+        })
+        .unwrap_or(0)
+}
+
+/// Parse [Defaults] section entries
+/// Format: defaultValue = constantName, value
+fn parse_defaults_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let key_lower = key.to_lowercase();
+
+    if key_lower == "defaultvalue" {
+        let parts = split_ini_line(value);
+        if parts.len() >= 2 {
+            let const_name = parts[0].trim().to_string();
+            if let Ok(val) = parts[1].trim().parse::<f64>() {
+                def.default_values.insert(const_name, val);
+            }
+        }
+    }
+}
+
+/// Substitute $variableName or \$variableName references with byte values from pc_variables
+/// In INI files, variables can appear as either $varName or \$varName (backslash-escaped)
+/// Returns the string with variable references replaced by byte values
+fn substitute_variables(
+    input: &str,
+    pc_variables: &std::collections::HashMap<String, u8>,
+) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Check for \$ (escaped variable reference - common in INI files)
+        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '$' {
+            // Start of escaped variable reference
+            let mut var_name = String::new();
+            i += 2; // Skip \$
+
+            // Collect variable name (alphanumeric and underscore)
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                var_name.push(chars[i]);
+                i += 1;
+            }
+
+            if let Some(&byte_val) = pc_variables.get(&var_name) {
+                // Replace with the byte value as a character
+                result.push(byte_val as char);
+            } else {
+                // Variable not found - keep the original \$varName
+                result.push('\\');
+                result.push('$');
+                result.push_str(&var_name);
+            }
+        } else if chars[i] == '$' {
+            // Start of unescaped variable reference
+            let mut var_name = String::new();
+            i += 1;
+
+            // Collect variable name (alphanumeric and underscore)
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                var_name.push(chars[i]);
+                i += 1;
+            }
+
+            if let Some(&byte_val) = pc_variables.get(&var_name) {
+                // Replace with the byte value as a character
+                result.push(byte_val as char);
+            } else {
+                // Variable not found - keep the original $varName
+                result.push('$');
+                result.push_str(&var_name);
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Parse a `[Datalog]` entry.
+///
+/// The columns are `Channel, Label, Type, Format[, {condition}]`, as the INI's
+/// own header comment states:
+///
+/// ```text
+/// ;       Channel          Label               Type    Format
+/// entry = rpm,             "RPM",              int,    "%d"
+/// entry = stagingActive,   "Fuel Staging",     int,    "onOff", { stagingEnabled }
+/// ```
+///
+/// This used to read `parts[2]` - the type - as the format, and `parts[3]` -
+/// the format - as an enabled flag, which is never the string "0" and so was
+/// always true. The condition was dropped entirely.
+///
+/// `split_ini_line` rather than `split(',')`: a condition expression can
+/// contain commas, and the naive split shatters it.
+fn parse_datalog_entry(def: &mut EcuDefinition, _key: &str, value: &str) {
+    let parts = crate::ini::split_ini_line(value);
+    if parts.is_empty() {
+        return;
+    }
+    let field = |i: usize| -> Option<String> {
+        parts
+            .get(i)
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let entry = DatalogEntry {
+        channel: parts[0].trim().trim_matches('"').to_string(),
+        label: field(1).unwrap_or_default(),
+        data_type: field(2).unwrap_or_else(|| "float".to_string()),
+        format: field(3).unwrap_or_else(|| "%.2f".to_string()),
+        condition: field(4).and_then(|s| {
+            s.strip_prefix('{')
+                .and_then(|s| s.strip_suffix('}'))
+                .map(|s| s.trim().to_string())
+        }),
+        // The INI has no disabled-by-default form; every declared entry is one
+        // the ECU offers. A condition, where present, decides at runtime.
+        enabled: true,
+    };
+    def.datalog_entries.push(entry);
+}
+
+/// Highest `gaugeN` index `[FrontPage]` may declare. The format documents
+/// `gauge1..gauge8`; the extra headroom covers INIs that go a little wider
+/// without letting a malformed suffix size the allocation.
+const MAX_FRONTPAGE_GAUGES: usize = 64;
+
+/// Parse [FrontPage] section entries
+/// Handles gauge1-gauge8 references and indicator definitions
+fn parse_frontpage_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    // Initialize frontpage if not already
+    if def.frontpage.is_none() {
+        def.frontpage = Some(FrontPageConfig::default());
+    }
+
+    let frontpage = def.frontpage.as_mut().unwrap();
+
+    // Handle gauge1-gauge8 entries
+    if key.to_lowercase().starts_with("gauge") {
+        if let Some(num_str) = key
+            .strip_prefix("gauge")
+            .or_else(|| key.strip_prefix("Gauge"))
+        {
+            if let Ok(num) = num_str.parse::<usize>() {
+                // The suffix comes straight from arbitrary INI text, so cap it
+                // before growing the vector - `gauge4000000000` used to try to
+                // allocate four billion empty strings.
+                if num == 0 || num > MAX_FRONTPAGE_GAUGES {
+                    tracing::warn!(
+                        "ini: [FrontPage] {} out of range (1..={}) - ignored",
+                        key,
+                        MAX_FRONTPAGE_GAUGES
+                    );
+                    return;
+                }
+                // Ensure vector is large enough
+                while frontpage.gauges.len() < num {
+                    frontpage.gauges.push(String::new());
+                }
+                frontpage.gauges[num - 1] = value.trim().to_string();
+            }
+        }
+    }
+    // Handle indicator entries
+    // Format: indicator = { expression }, "off-label", "on-label", off-bg, off-fg, on-bg, on-fg
+    else if key.eq_ignore_ascii_case("indicator") {
+        if let Some(indicator) = parse_frontpage_indicator(value) {
+            frontpage.indicators.push(indicator);
+        }
+    }
+}
+
+/// Parse a FrontPage indicator definition
+/// Format: { expression }, "off-label", "on-label", off-bg, off-fg, on-bg, on-fg
+/// Or:     { expression }, "off-label", { dynamic-on-label }, off-bg, off-fg, on-bg, on-fg
+fn parse_frontpage_indicator(value: &str) -> Option<FrontPageIndicator> {
+    let value = value.trim();
+
+    // Extract the expression (between first { and matching })
+    if !value.starts_with('{') {
+        return None;
+    }
+
+    let mut brace_depth = 0;
+    let mut expr_end = 0;
+    for (i, ch) in value.char_indices() {
+        match ch {
+            '{' => brace_depth += 1,
+            '}' => {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    expr_end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if expr_end == 0 {
+        return None;
+    }
+
+    let expression = value[1..expr_end].trim().to_string();
+    let remaining = value[expr_end + 1..].trim();
+
+    // Skip the comma after expression
+    let remaining = remaining.strip_prefix(',').unwrap_or(remaining).trim();
+
+    // Parse the remaining parts: "off-label", "on-label" or { dynamic }, off-bg, off-fg, on-bg, on-fg
+    // Use a custom split that respects braces and quotes
+    let parts = split_frontpage_parts(remaining);
+
+    if parts.len() < 6 {
+        // Need at least: off-label, on-label, 4 colors
+        return None;
+    }
+
+    Some(FrontPageIndicator {
+        expression,
+        label_off: parts[0].trim_matches('"').to_string(),
+        label_on: parts[1].trim_matches('"').to_string(),
+        bg_off: parts[2].trim().to_string(),
+        fg_off: parts[3].trim().to_string(),
+        bg_on: parts[4].trim().to_string(),
+        fg_on: parts[5].trim().to_string(),
+    })
+}
+
+/// Split FrontPage indicator parts, respecting braces and quotes
+fn split_frontpage_parts(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut brace_depth = 0;
+
+    for ch in s.chars() {
+        match ch {
+            '"' if brace_depth == 0 => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '{' if !in_quotes => {
+                brace_depth += 1;
+                current.push(ch);
+            }
+            '}' if !in_quotes => {
+                brace_depth -= 1;
+                current.push(ch);
+            }
+            ',' if !in_quotes && brace_depth == 0 => {
+                parts.push(current.trim().to_string());
+                current = String::new();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+
+    parts
+}
+
+/// Parse [TableEditor] section entries
+fn parse_table_editor_entry(
+    def: &mut EcuDefinition,
+    key: &str,
+    value: &str,
+    current_table: &mut Option<String>,
+) {
+    if key.eq_ignore_ascii_case("table") {
+        // Format: table = tableName, mapName, "Title", page
+        // Where mapName is what menus reference (e.g., veTable1Map)
+        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 3 {
+            // Store map_name (parts[1]) - this is what menus reference
+            let map_name = parts[1].to_string();
+            let table = TableDefinition {
+                name: parts[0].to_string(),
+                map_name: Some(map_name.clone()),
+                title: parts
+                    .get(2)
+                    .map(|s| s.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+                page: parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0),
+                ..Default::default()
+            };
+
+            // Build reverse lookup: map_name -> table name
+            def.table_map_to_name.insert(map_name, table.name.clone());
+
+            *current_table = Some(table.name.clone());
+            def.tables.insert(table.name.clone(), table);
+        }
+    } else if let Some(table_name) = current_table {
+        if let Some(table) = def.tables.get_mut(table_name) {
+            match key.to_lowercase().as_str() {
+                "xbins" => {
+                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    if !parts.is_empty() {
+                        table.x_bins = parts[0].to_string();
+                        table.x_output_channel = parts.get(1).map(|s| s.to_string());
+                    }
+                }
+                "ybins" => {
+                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    if !parts.is_empty() {
+                        table.y_bins = Some(parts[0].to_string());
+                        table.y_output_channel = parts.get(1).map(|s| s.to_string());
+                        table.table_type = super::tables::TableType::ThreeD;
+                    }
+                }
+                "zbins" => {
+                    table.map = value.trim().to_string();
+                }
+                "gridheight" => {
+                    table.grid_height = value.parse().ok();
+                }
+                "topichelp" => {
+                    table.help = Some(value.trim_matches('"').to_string());
+                }
+                "xylabels" => {
+                    // Format: xyLabels = "X Label", "Y Label" or expressions like {bitStringValue(...)}
+                    // Use split_ini_line to properly handle expressions with commas inside braces
+                    let parts = split_ini_line(value);
+                    if !parts.is_empty() {
+                        table.x_label = Some(parts[0].trim_matches('"').to_string());
+                    }
+                    if parts.len() >= 2 {
+                        table.y_label = Some(parts[1].trim_matches('"').to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Parse [CurveEditor] section entries
+fn parse_curve_editor_entry(
+    def: &mut EcuDefinition,
+    key: &str,
+    value: &str,
+    current_curve: &mut Option<String>,
+) {
+    if key.eq_ignore_ascii_case("curve") {
+        // Format: curve = curveName, "Title"
+        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+        if !parts.is_empty() {
+            let curve = CurveDefinition {
+                name: parts[0].to_string(),
+                title: parts
+                    .get(1)
+                    .map(|s| s.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+                ..Default::default()
+            };
+
+            *current_curve = Some(curve.name.clone());
+            def.curves.insert(curve.name.clone(), curve);
+        }
+    } else if let Some(curve_name) = current_curve {
+        if let Some(curve) = def.curves.get_mut(curve_name) {
+            match key.to_lowercase().as_str() {
+                "columnlabel" => {
+                    // Format: columnLabel = "X Label", "Y Label"
+                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    if parts.len() >= 2 {
+                        curve.column_labels = (
+                            parts[0].trim_matches('"').to_string(),
+                            parts[1].trim_matches('"').to_string(),
+                        );
+                    }
+                }
+                "xaxis" => {
+                    // Format: xAxis = min, max, step
+                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    if parts.len() >= 3 {
+                        if let (Ok(min), Ok(max), Ok(step)) = (
+                            parts[0].parse::<f32>(),
+                            parts[1].parse::<f32>(),
+                            parts[2].parse::<f32>(),
+                        ) {
+                            curve.x_axis = Some((min, max, step));
+                        }
+                    }
+                }
+                "yaxis" => {
+                    // Format: yAxis = min, max, step
+                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    if parts.len() >= 3 {
+                        if let (Ok(min), Ok(max), Ok(step)) = (
+                            parts[0].parse::<f32>(),
+                            parts[1].parse::<f32>(),
+                            parts[2].parse::<f32>(),
+                        ) {
+                            curve.y_axis = Some((min, max, step));
+                        }
+                    }
+                }
+                "xbins" => {
+                    // Format: xBins = binVariable, displayVariable
+                    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+                    if !parts.is_empty() {
+                        curve.x_bins = parts[0].to_string();
+                        curve.x_output_channel = parts.get(1).map(|s| s.to_string());
+                    }
+                }
+                "ybins" => {
+                    // Format: yBins = valueVariable[, outputChannel]
+                    let parts = split_ini_line(value);
+                    if !parts.is_empty() {
+                        curve.y_bins = parts[0].trim().to_string();
+                    }
+                }
+                "size" => {
+                    // Format: size = count
+                    curve.size = value.trim().parse().ok();
+                }
+                "topichelp" => {
+                    curve.help = Some(value.trim_matches('"').to_string());
+                }
+                "gauge" => {
+                    // Format: gauge = GaugeName
+                    curve.gauge = Some(value.trim().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Post-process: Apply variable substitution to command strings
+/// This handles cases where commands (like queryCommand in [MegaTune]) are defined
+/// before [PcVariables] section is parsed
+fn post_process_variable_substitution(def: &mut EcuDefinition) {
+    // Skip if no PC variables defined
+    if def.pc_variables.is_empty() {
+        return;
+    }
+
+    // Re-resolve every PC variable now that the whole file has been read.
+    // `[PcVariables]` is parsed before `[Defaults]` in some INIs, so the value
+    // recorded at declaration time may predate the `defaultValue` line that
+    // sets it.
+    let names: Vec<String> = def.pc_variables.keys().cloned().collect();
+    for name in names {
+        let resolved = resolve_pc_variable_byte(def, &name);
+        def.pc_variables.insert(name, resolved);
+    }
+
+    // Substitute in query_command
+    def.query_command = substitute_variables(&def.query_command, &def.pc_variables);
+    def.protocol.query_command =
+        substitute_variables(&def.protocol.query_command, &def.pc_variables);
+
+    // Substitute in version_info (can also contain variables)
+    def.version_info = substitute_variables(&def.version_info, &def.pc_variables);
+
+    // Re-process page identifiers and commands if they contain unresolved variables
+    // (This handles cases where PcVariables was defined after Constants)
+    // Note: The initial parse already applied substitution if PcVariables was parsed first,
+    // but we re-apply to handle any remaining $varName references
+
+    // Clone pc_variables to avoid borrow conflicts
+    let pc_vars = def.pc_variables.clone();
+
+    for cmd in &mut def.protocol.page_read_commands {
+        if cmd.contains('$') {
+            *cmd = substitute_variables(cmd, &pc_vars);
+        }
+    }
+    for cmd in &mut def.protocol.page_chunk_write_commands {
+        if cmd.contains('$') {
+            *cmd = substitute_variables(cmd, &pc_vars);
+        }
+    }
+    for cmd in &mut def.protocol.burn_commands {
+        if cmd.contains('$') {
+            *cmd = substitute_variables(cmd, &pc_vars);
+        }
+    }
+    for cmd in &mut def.protocol.crc32_check_commands {
+        if cmd.contains('$') {
+            *cmd = substitute_variables(cmd, &pc_vars);
+        }
+    }
+
+    // Re-process page identifiers from the source text.
+    //
+    // `page_identifiers` is `Vec<Vec<u8>>`, so the `$tsCanId` token is already
+    // gone by the time we get here - re-substituting the bytes is impossible.
+    // `page_identifiers_raw` keeps the INI's own strings precisely so this pass
+    // can redo the work with the resolved variables. Without it a board with a
+    // non-zero `tsCanId` addressed every page read/write frame to CAN id 0,
+    // since `[Constants]` is written before `[PcVariables]`.
+    if def
+        .protocol
+        .page_identifiers_raw
+        .iter()
+        .any(|s| s.contains('$'))
+    {
+        def.protocol.page_identifiers = def
+            .protocol
+            .page_identifiers_raw
+            .iter()
+            .map(|s| parse_escape_sequence(&substitute_variables(s, &pc_vars)))
+            .collect();
+    }
+
+    // Handle och_get_command
+    if let Some(ref cmd) = def.protocol.och_get_command {
+        if cmd.contains('$') {
+            def.protocol.och_get_command = Some(substitute_variables(cmd, &pc_vars));
+        }
+    }
+
+    // Handle burst_get_command
+    if let Some(ref cmd) = def.protocol.burst_get_command {
+        if cmd.contains('$') {
+            def.protocol.burst_get_command = Some(substitute_variables(cmd, &pc_vars));
+        }
+    }
+}
+
+/// Post-process menu items to fix types that couldn't be determined during initial parse
+/// This handles cases where help topics are defined after the Menu section
+fn post_process_menu_items(def: &mut EcuDefinition) {
+    for menu in &mut def.menus {
+        post_process_items(
+            &mut menu.items,
+            &def.help_topics,
+            &def.tables,
+            &def.table_map_to_name,
+            &def.curves,
+        );
+    }
+}
+
+fn post_process_items(
+    items: &mut Vec<MenuItem>,
+    help_topics: &std::collections::HashMap<String, HelpTopic>,
+    tables: &std::collections::HashMap<String, crate::ini::TableDefinition>,
+    table_map_to_name: &std::collections::HashMap<String, String>,
+    curves: &std::collections::HashMap<String, crate::ini::CurveDefinition>,
+) {
+    for item in items {
+        match item {
+            MenuItem::Dialog {
+                label,
+                target,
+                visibility_condition,
+                enabled_condition,
+                ..
+            } => {
+                // Check if this should be a different type
+                if help_topics.contains_key(target) {
+                    *item = MenuItem::Help {
+                        label: label.clone(),
+                        target: target.clone(),
+                        visibility_condition: visibility_condition.clone(),
+                        enabled_condition: enabled_condition.clone(),
+                        visible: true,
+                        enabled: true,
+                    };
+                } else if tables.contains_key(target)
+                    || table_map_to_name.contains_key(target)
+                    || curves.contains_key(target)
+                {
+                    // Target can be either the table name or the map name
+                    *item = MenuItem::Table {
+                        label: label.clone(),
+                        target: target.clone(),
+                        visibility_condition: visibility_condition.clone(),
+                        enabled_condition: enabled_condition.clone(),
+                        visible: true,
+                        enabled: true,
+                    };
+                }
+            }
+            MenuItem::SubMenu {
+                items: sub_items, ..
+            } => {
+                post_process_items(sub_items, help_topics, tables, table_map_to_name, curves);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fill allocated [`Shape`] sizes for constants declared with `{const}` dimensions.
+fn post_process_dynamic_shapes(def: &mut EcuDefinition) {
+    let names: Vec<String> = def
+        .constants
+        .iter()
+        .filter(|(_, c)| c.dynamic_size.is_some())
+        .map(|(n, _)| n.clone())
+        .collect();
+
+    for name in names {
+        let dyn_refs = match def
+            .constants
+            .get(&name)
+            .and_then(|c| c.dynamic_size.clone())
+        {
+            Some(d) => d,
+            None => continue,
+        };
+
+        if let Some(cols_name) = &dyn_refs.cols_const {
+            // 2D: [{cols}x{rows}] — allocated footprint is maximumElements (cell budget).
+            let def_cols = def
+                .default_values
+                .get(cols_name)
+                .copied()
+                .unwrap_or(0.0)
+                .round() as usize;
+            let def_rows = def
+                .default_values
+                .get(&dyn_refs.rows_const)
+                .copied()
+                .unwrap_or(0.0)
+                .round() as usize;
+            let max_el = def
+                .maximum_elements
+                .get(&name)
+                .copied()
+                .unwrap_or(def_cols.saturating_mul(def_rows));
+
+            let (rows, cols) = if def_rows > 0 && def_cols > 0 && def_rows * def_cols == max_el {
+                (def_rows, def_cols)
+            } else if def_cols > 0 && max_el > 0 && max_el % def_cols == 0 {
+                (max_el / def_cols, def_cols)
+            } else if max_el > 0 {
+                (max_el, 1)
+            } else {
+                (def_rows.max(1), def_cols.max(1))
+            };
+
+            if let Some(c) = def.constants.get_mut(&name) {
+                c.shape = Shape::Array2D { rows, cols };
+            }
+        } else {
+            // 1D: [{count}] — allocate to the count scalar's max (axis headroom).
+            let count_name = &dyn_refs.rows_const;
+            let allocated = def
+                .constants
+                .get(count_name)
+                .map(|c| c.max.round() as usize)
+                .filter(|n| *n > 0)
+                .or_else(|| {
+                    def.default_values
+                        .get(count_name)
+                        .map(|v| v.round() as usize)
+                })
+                .unwrap_or(0)
+                .max(1);
+
+            if let Some(c) = def.constants.get_mut(&name) {
+                c.shape = Shape::Array1D(allocated);
+            }
+        }
+    }
+}
+
+/// Post-process tables to resolve x_size and y_size from referenced constant shapes
+///
+/// TableEditor entries reference constants by name (e.g., xBins = veRpmBins, zBins = veTable)
+/// but the table's x_size/y_size aren't set during initial parsing. This function looks up
+/// each constant and extracts dimensions from its Shape.
+fn post_process_table_sizes(def: &mut EcuDefinition) {
+    // Collect table names first to avoid borrow issues
+    let table_names: Vec<String> = def.tables.keys().cloned().collect();
+
+    for table_name in table_names {
+        // Get the constant names we need to look up
+        let (x_bins_name, y_bins_name, map_name) = {
+            let table = match def.tables.get(&table_name) {
+                Some(t) => t,
+                None => continue,
+            };
+            (
+                table.x_bins.clone(),
+                table.y_bins.clone(),
+                table.map.clone(),
+            )
+        };
+
+        // Dynamically sized maps: table editor default size comes from defaultValue
+        // of the count scalars (not the allocated bin/axis headroom).
+        let dynamic_defaults = def.constants.get(&map_name).and_then(|map_const| {
+            let d = map_const.dynamic_size.as_ref()?;
+            let cols_name = d.cols_const.as_ref()?;
+            let cols = def.default_values.get(cols_name).copied()?.round() as usize;
+            let rows = def.default_values.get(&d.rows_const).copied()?.round() as usize;
+            if cols > 0 && rows > 0 {
+                Some((cols, rows))
+            } else {
+                None
+            }
+        });
+
+        // Look up x_size from x_bins constant
+        let x_size = if let Some(x_const) = def.constants.get(&x_bins_name) {
+            x_const.shape.x_size()
+        } else {
+            0
+        };
+
+        // Look up y_size from y_bins constant (if 3D table) or map constant
+        let y_size = if let Some(ref y_bins_name) = y_bins_name {
+            if let Some(y_const) = def.constants.get(y_bins_name) {
+                y_const.shape.x_size() // y_bins is a 1D array, use its size
+            } else {
+                1
+            }
+        } else {
+            1 // 2D table has y_size = 1
+        };
+
+        // Alternatively, infer from map constant shape if we have a 2D map
+        let (final_x_size, final_y_size) = if let Some((cols, rows)) = dynamic_defaults {
+            (cols, rows)
+        } else if let Some(map_const) = def.constants.get(&map_name) {
+            match &map_const.shape {
+                crate::ini::types::Shape::Array2D { rows, cols } => {
+                    // Use map's actual dimensions if available
+                    (*cols, *rows)
+                }
+                crate::ini::types::Shape::Array1D(size) => {
+                    // 1D map - use x_size from bins, y_size = 1
+                    if x_size > 0 {
+                        (x_size, 1)
+                    } else {
+                        (*size, 1)
+                    }
+                }
+                crate::ini::types::Shape::Scalar => (x_size, y_size),
+            }
+        } else {
+            (x_size, y_size)
+        };
+
+        let resize_meta = def.constants.get(&map_name).and_then(|map_const| {
+            let d = map_const.dynamic_size.as_ref()?;
+            let cols = d.cols_const.clone()?;
+            let max_el = def.maximum_elements.get(&map_name).copied();
+            Some((d.rows_const.clone(), cols, max_el))
+        });
+
+        // Update the table - only update if we calculated a meaningful size
+        // x_size defaults to 0, y_size defaults to 1 in TableDefinition::default()
+        if let Some(table) = def.tables.get_mut(&table_name) {
+            if table.x_size == 0 && final_x_size > 0 {
+                table.x_size = final_x_size;
+            }
+            if table.y_size <= 1 && final_y_size > 1 {
+                table.y_size = final_y_size;
+            }
+            if let Some((rows_c, cols_c, max_el)) = resize_meta {
+                table.rows_size_const = Some(rows_c);
+                table.cols_size_const = Some(cols_c);
+                table.max_elements = max_el;
+            }
+        }
+    }
+}
+
+/// Parse [Menu] section entries
+fn parse_menu_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let key = key.to_lowercase();
+    match key.as_str() {
+        "menu" => {
+            let parts = split_ini_line(value);
+            if !parts.is_empty() {
+                let name = parts[0].trim_matches('"').to_string();
+                let title = parts[0].trim_matches('"').to_string(); // Use same as name for key
+                def.menus.push(Menu {
+                    name,
+                    title,
+                    items: Vec::new(),
+                });
+            }
+        }
+        "submenu" | "groupchildmenu" => {
+            let parts = split_ini_line(value);
+            if parts.is_empty() {
+                return;
+            }
+
+            // Handle multiple INI formats:
+            // 1. Standard comma-separated: target, "Label", { condition }
+            // 2. Space-separated: target    "Label", { condition }  (no comma between target and label)
+            // 3. Dual-condition: target "Label", { visibility_cond }, { enable_cond }
+            // According to EFI Analytics spec:
+            //   - 1 expression = enable/disable condition
+            //   - 2 expressions = visibility (first) and enable (second)
+            let (target, label, visibility_condition, enabled_condition) = {
+                let first_part = parts[0].trim();
+
+                // Helper to extract condition from a part
+                let extract_condition = |s: &str| -> Option<String> {
+                    let trimmed = s.trim_matches(|c| c == '{' || c == '}').trim();
+                    if trimmed.is_empty() || trimmed == "0" || trimmed == "1" {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                };
+
+                // Check if first part contains both target and quoted label (space-separated format)
+                if let Some(quote_pos) = first_part.find('"') {
+                    // Format 2 or 3: target "Label" in parts[0]
+                    let target = first_part[..quote_pos].trim().to_string();
+                    // Extract the quoted label - find matching end quote
+                    let label_start = quote_pos + 1;
+                    let label = if let Some(end_quote) = first_part[label_start..].find('"') {
+                        first_part[label_start..label_start + end_quote].to_string()
+                    } else {
+                        first_part[label_start..].trim_matches('"').to_string()
+                    };
+
+                    // Check for 2 conditions (visibility + enable)
+                    let (vis_cond, en_cond) = if parts.len() >= 3 {
+                        // Two conditions: first is visibility, second is enable
+                        (extract_condition(&parts[1]), extract_condition(&parts[2]))
+                    } else if parts.len() >= 2 {
+                        // One condition: it's the enable condition
+                        (None, extract_condition(&parts[1]))
+                    } else {
+                        (None, None)
+                    };
+                    (target, label, vis_cond, en_cond)
+                } else if parts.len() >= 2 {
+                    // Format 1: Standard comma-separated
+                    let target = first_part.trim_matches('"').to_string();
+                    let label = parts[1].trim_matches('"').to_string();
+
+                    // Check for 2 conditions (visibility + enable)
+                    let (vis_cond, en_cond) = if parts.len() >= 4 {
+                        // Two conditions: first is visibility, second is enable
+                        (extract_condition(&parts[2]), extract_condition(&parts[3]))
+                    } else if parts.len() >= 3 {
+                        // One condition: it's the enable condition
+                        (None, extract_condition(&parts[2]))
+                    } else {
+                        (None, None)
+                    };
+                    (target, label, vis_cond, en_cond)
+                } else {
+                    // Only target, no label - use target as label
+                    (first_part.to_string(), first_part.to_string(), None, None)
+                }
+            };
+
+            // Skip invalid entries
+            if target.is_empty() {
+                return;
+            }
+
+            // Determine the correct MenuItem type based on target
+            let item = if target == "std_separator" {
+                // Separator - render as visual divider, not a clickable item
+                MenuItem::Separator
+            } else if target.starts_with("std_") {
+                // Built-in standard targets like std_realtime, std_ms2gentherm, etc.
+                MenuItem::Std {
+                    label,
+                    target,
+                    visibility_condition,
+                    enabled_condition,
+                    visible: true,
+                    enabled: true,
+                }
+            } else if def.help_topics.contains_key(&target) {
+                // Help topic reference
+                MenuItem::Help {
+                    label,
+                    target,
+                    visibility_condition,
+                    enabled_condition,
+                    visible: true,
+                    enabled: true,
+                }
+            } else if def.tables.contains_key(&target) || def.curves.contains_key(&target) {
+                // Table or curve reference
+                MenuItem::Table {
+                    label,
+                    target,
+                    visibility_condition,
+                    enabled_condition,
+                    visible: true,
+                    enabled: true,
+                }
+            } else {
+                // Default to dialog
+                MenuItem::Dialog {
+                    label,
+                    target,
+                    visibility_condition,
+                    enabled_condition,
+                    visible: true,
+                    enabled: true,
+                }
+            };
+
+            if let Some(menu) = def.menus.last_mut() {
+                if key == "groupchildmenu" {
+                    if let Some(MenuItem::SubMenu { items, .. }) = menu.items.last_mut() {
+                        items.push(item);
+                        return;
+                    }
+                }
+                menu.items.push(item);
+            }
+        }
+        "groupmenu" => {
+            let parts = split_ini_line(value);
+            if !parts.is_empty() {
+                let label = parts[0].trim_matches('"').to_string();
+
+                // Extract conditions: 1 = enable, 2 = visibility + enable
+                let extract_condition = |s: &str| -> Option<String> {
+                    let trimmed = s.trim_matches(|c| c == '{' || c == '}').trim();
+                    if trimmed.is_empty() || trimmed == "0" || trimmed == "1" {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                };
+
+                let (visibility_condition, enabled_condition) = if parts.len() >= 3 {
+                    // Two conditions: first is visibility, second is enable
+                    (extract_condition(&parts[1]), extract_condition(&parts[2]))
+                } else if parts.len() >= 2 {
+                    // One condition: it's the enable condition
+                    (None, extract_condition(&parts[1]))
+                } else {
+                    (None, None)
+                };
+
+                if let Some(menu) = def.menus.last_mut() {
+                    menu.items.push(MenuItem::SubMenu {
+                        label,
+                        items: Vec::new(),
+                        visibility_condition,
+                        enabled_condition,
+                        visible: true,
+                        enabled: true,
+                    });
+                }
+            }
+        }
+        "std_separator" => {
+            if let Some(menu) = def.menus.last_mut() {
+                menu.items.push(MenuItem::Separator);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse [SettingContextHelp] section entries
+/// Format: constantName = "Help text for this constant"
+fn parse_setting_context_help(def: &mut EcuDefinition, key: &str, value: &str) {
+    // The key is the constant name, value is the help text
+    if let Some(constant) = def.constants.get_mut(key) {
+        constant.help = Some(value.trim_matches('"').to_string());
+    }
+}
+
+/// Parse [UserDefined] section entries
+fn parse_user_defined_entry(
+    def: &mut EcuDefinition,
+    key: &str,
+    value: &str,
+    current_dialog: &mut Option<String>,
+    current_indicator_panel: &mut Option<String>,
+    current_readout_panel: &mut Option<String>,
+    current_help: &mut Option<String>,
+) {
+    let key = key.to_lowercase();
+    match key.as_str() {
+        "help" => {
+            // Format: help = name, "Title"
+            let parts = split_ini_line(value);
+            if !parts.is_empty() {
+                let name = parts[0].to_string();
+                let title = parts
+                    .get(1)
+                    .map(|s| s.trim_matches('"').to_string())
+                    .unwrap_or_else(|| name.clone());
+
+                let help_topic = HelpTopic {
+                    name: name.clone(),
+                    title,
+                    web_url: None,
+                    text_lines: Vec::new(),
+                };
+                def.help_topics.insert(name.clone(), help_topic);
+                *current_help = Some(name);
+            }
+        }
+        "webhelp" => {
+            // Format: webHelp = "https://example.com/help/topic"
+            if let Some(name) = current_help {
+                if let Some(help_topic) = def.help_topics.get_mut(name) {
+                    help_topic.web_url = Some(value.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+        "text" => {
+            // Format: text = "Help text line"
+            if let Some(name) = current_help {
+                if let Some(help_topic) = def.help_topics.get_mut(name) {
+                    help_topic
+                        .text_lines
+                        .push(value.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+        "dialog" => {
+            let parts = split_ini_line(value);
+            if !parts.is_empty() {
+                let name = parts[0].to_string();
+                let title = parts
+                    .get(1)
+                    .map(|s| s.trim_matches('"').to_string())
+                    .unwrap_or_else(|| name.clone());
+
+                // Format: dialog = name, "title" [, layoutHint] [, {condition}]
+                // layoutHint (e.g. "xAxis") is the first remaining part that
+                // isn't a braced condition.
+                let layout_hint = parts
+                    .iter()
+                    .skip(2)
+                    .find(|p| !p.trim().starts_with('{'))
+                    .map(|p| p.trim().to_string());
+
+                let dialog = DialogDefinition {
+                    name: name.clone(),
+                    title,
+                    components: Vec::new(),
+                    layout_hint,
+                };
+                def.dialogs.insert(name.clone(), dialog);
+                *current_dialog = Some(name);
+                *current_indicator_panel = None;
+                *current_readout_panel = None;
+            }
+        }
+        "indicatorpanel" => {
+            // Format: indicatorPanel = name [, columns] [, {visibility_condition}]
+            // `columns` is optional in the wild (e.g. rusEFI's
+            // fuelClosedLoopIndicatorsPanel omits it) — requiring it dropped
+            // the whole panel silently, which also left current_dialog
+            // pointing at whatever dialog was last opened (this arm only
+            // clears it inside the block below), so the indicator lines
+            // meant for this panel got misattributed there as bare
+            // single-indicator fields instead.
+            let parts = split_ini_line(value);
+            if !parts.is_empty() {
+                let name = parts[0].to_string();
+                let columns = parts.get(1).and_then(|p| p.parse::<u8>().ok()).unwrap_or(2);
+
+                // Check for visibility condition (last part in braces)
+                let visibility_condition = parts
+                    .iter()
+                    .skip(2)
+                    .find(|p| {
+                        let trimmed = p.trim();
+                        trimmed.starts_with('{') && trimmed.ends_with('}')
+                    })
+                    .map(|p| p.trim().trim_matches(|c| c == '{' || c == '}').to_string());
+
+                let panel = IndicatorPanel {
+                    name: name.clone(),
+                    columns,
+                    visibility_condition,
+                    indicators: Vec::new(),
+                };
+                def.indicator_panels.insert(name.clone(), panel);
+                *current_indicator_panel = Some(name);
+                *current_readout_panel = None;
+                *current_dialog = None;
+            }
+        }
+        "readoutpanel" => {
+            // Format: readoutPanel = name [, columns] [, {visibility_condition}]
+            let parts = split_ini_line(value);
+            if !parts.is_empty() {
+                let name = parts[0].to_string();
+                let columns = parts
+                    .iter()
+                    .skip(1)
+                    .find(|p| {
+                        let trimmed = p.trim();
+                        !trimmed.starts_with('{') && trimmed.parse::<u8>().is_ok()
+                    })
+                    .and_then(|p| p.trim().parse().ok())
+                    .unwrap_or(1);
+
+                let visibility_condition = parts
+                    .iter()
+                    .skip(1)
+                    .find(|p| {
+                        let trimmed = p.trim();
+                        trimmed.starts_with('{') && trimmed.ends_with('}')
+                    })
+                    .map(|p| {
+                        p.trim()
+                            .trim_matches(|c| c == '{' || c == '}')
+                            .trim()
+                            .to_string()
+                    });
+
+                let panel = ReadoutPanel {
+                    name: name.clone(),
+                    columns,
+                    visibility_condition,
+                    readouts: Vec::new(),
+                };
+                def.readout_panels.insert(name.clone(), panel);
+                *current_readout_panel = Some(name);
+                *current_indicator_panel = None;
+                *current_dialog = None;
+            }
+        }
+        "readout" => {
+            if let Some(panel_name) = current_readout_panel {
+                if let Some(panel) = def.readout_panels.get_mut(panel_name) {
+                    let parts = split_ini_line(value);
+                    if parts.len() >= 2 {
+                        let channel = parts[0].trim().to_string();
+                        let title = parts[1].trim_matches('"').to_string();
+                        let units = parts
+                            .get(2)
+                            .map(|s| s.trim_matches('"').to_string())
+                            .unwrap_or_default();
+                        let digits = parts
+                            .get(parts.len().saturating_sub(2))
+                            .and_then(|s| s.trim().parse().ok())
+                            .unwrap_or(0);
+                        let precision = parts
+                            .last()
+                            .and_then(|s| s.trim().parse().ok())
+                            .unwrap_or(0);
+
+                        panel.readouts.push(ReadoutDefinition {
+                            channel,
+                            title,
+                            units,
+                            digits,
+                            precision,
+                        });
+                    }
+                }
+            }
+        }
+        "panel" => {
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    let panel_name = parts.first().unwrap_or(&String::new()).trim().to_string();
+                    // Position is the first non-brace part after the panel name (West/East/Center)
+                    let position = parts
+                        .iter()
+                        .skip(1)
+                        .find(|p| !p.trim().starts_with('{'))
+                        .map(|p| p.trim().to_string());
+                    // TunerStudio panel conditions (opposite order from fields/menus):
+                    //   panel = name, {enable}
+                    //   panel = name, {enable}, {visibility}
+                    //   panel = name, West, {visibility}  (position before braces)
+                    let brace_parts: Vec<String> = parts
+                        .iter()
+                        .skip(1)
+                        .filter_map(|p| {
+                            let trimmed = p.trim();
+                            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                                Some(
+                                    trimmed
+                                        .trim_matches(|c| c == '{' || c == '}')
+                                        .trim()
+                                        .to_string(),
+                                )
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let is_trivial_condition = |s: &str| s.is_empty() || s == "0" || s == "1";
+                    let (enabled_condition, visibility_condition) = if brace_parts.len() >= 2 {
+                        (
+                            if is_trivial_condition(&brace_parts[0]) {
+                                None
+                            } else {
+                                Some(brace_parts[0].clone())
+                            },
+                            if is_trivial_condition(&brace_parts[1]) {
+                                None
+                            } else {
+                                Some(brace_parts[1].clone())
+                            },
+                        )
+                    } else if brace_parts.len() == 1 {
+                        // Single brace on a panel is the enable expression in TunerStudio.
+                        // LibreTune hides the panel when this is false (collapsed module UX).
+                        (
+                            if is_trivial_condition(&brace_parts[0]) {
+                                None
+                            } else {
+                                Some(brace_parts[0].clone())
+                            },
+                            None,
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    dialog.components.push(DialogComponent::Panel {
+                        name: panel_name,
+                        position,
+                        enabled_condition,
+                        visibility_condition,
+                    });
+                }
+            }
+        }
+        "livegraph" => {
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    if parts.len() >= 2 {
+                        dialog.components.push(DialogComponent::LiveGraph {
+                            name: parts[0].to_string(),
+                            title: parts[1].trim_matches('"').to_string(),
+                            position: parts.get(2).cloned().unwrap_or_else(|| "South".to_string()),
+                            channels: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+        "graphline" => {
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    if let Some(DialogComponent::LiveGraph { channels, .. }) =
+                        dialog.components.last_mut()
+                    {
+                        channels.push(value.trim().to_string());
+                    }
+                }
+            }
+        }
+        "runtimevalue" => {
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    if parts.len() >= 2 {
+                        let label = parts[0].trim_matches('"').to_string();
+                        let channel = parts[1].trim().to_string();
+                        let visibility_condition = parts
+                            .iter()
+                            .skip(2)
+                            .find(|p| {
+                                let trimmed = p.trim();
+                                trimmed.starts_with('{') && trimmed.ends_with('}')
+                            })
+                            .map(|p| {
+                                p.trim()
+                                    .trim_matches(|c| c == '{' || c == '}')
+                                    .trim()
+                                    .to_string()
+                            });
+
+                        dialog.components.push(DialogComponent::RuntimeValue {
+                            label,
+                            name: channel,
+                            visibility_condition,
+                        });
+                    }
+                }
+            }
+        }
+        "field" => {
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    if parts.len() >= 2 {
+                        let label = parts[0].trim_matches('"').to_string();
+                        let field_name = parts[1].trim().to_string();
+                        // Check for conditions in curly braces
+                        // Format: field = "Label", name, {visibility}, {enable}
+                        // Or: field = "Label", name, {condition} (single condition = enable)
+                        let conditions: Vec<String> = parts
+                            .iter()
+                            .skip(2)
+                            .filter_map(|p| {
+                                let trimmed = p.trim();
+                                if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                                    Some(trimmed.trim_matches(|c| c == '{' || c == '}').to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        let visibility_condition = if conditions.len() >= 2 {
+                            Some(conditions[0].clone())
+                        } else {
+                            None
+                        };
+
+                        let enabled_condition = if conditions.len() >= 2 {
+                            Some(conditions[1].clone())
+                        } else if conditions.len() == 1 {
+                            Some(conditions[0].clone())
+                        } else {
+                            None
+                        };
+
+                        dialog.components.push(DialogComponent::Field {
+                            label,
+                            name: field_name,
+                            visibility_condition,
+                            enabled_condition,
+                        });
+                    } else if !parts.is_empty() {
+                        let text = parts[0].trim_matches('"').to_string();
+                        dialog.components.push(DialogComponent::Label { text });
+                    }
+                }
+            }
+        }
+        "table" => {
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    dialog.components.push(DialogComponent::Table {
+                        name: value.trim().to_string(),
+                    });
+                }
+            }
+        }
+        "indicator" => {
+            // Check if we're in an indicatorPanel or a dialog
+            if let Some(panel_name) = current_indicator_panel {
+                if let Some(panel) = def.indicator_panels.get_mut(panel_name) {
+                    // Format: indicator = {expression}, "label_off", "label_on" [, color_off_fg, color_off_bg, color_on_fg, color_on_bg]
+                    let parts = split_ini_line(value);
+                    if parts.len() >= 3 {
+                        let expression =
+                            parts[0].trim_matches(|c| c == '{' || c == '}').to_string();
+                        let label_off = parts[1].trim_matches('"').to_string();
+                        let label_on = parts[2].trim_matches('"').to_string();
+
+                        // Optional colors (parts 3-6)
+                        let color_off_fg = parts.get(3).map(|s| s.trim().to_string());
+                        let color_off_bg = parts.get(4).map(|s| s.trim().to_string());
+                        let color_on_fg = parts.get(5).map(|s| s.trim().to_string());
+                        let color_on_bg = parts.get(6).map(|s| s.trim().to_string());
+
+                        panel.indicators.push(IndicatorDefinition {
+                            expression,
+                            label_off,
+                            label_on,
+                            color_off_fg,
+                            color_off_bg,
+                            color_on_fg,
+                            color_on_bg,
+                        });
+                    }
+                }
+            } else if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    if parts.len() >= 3 {
+                        dialog.components.push(DialogComponent::Indicator {
+                            expression: parts[0].trim_matches(|c| c == '{' || c == '}').to_string(),
+                            label_off: parts[1].trim_matches('"').to_string(),
+                            label_on: parts[2].trim_matches('"').to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        "commandbutton" => {
+            // Format: commandButton = "Label", command_name [, { condition }] [, clickOnClose|clickOnCloseIfEnabled|clickOnCloseIfDisabled]
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    if parts.len() >= 2 {
+                        let label = parts[0].trim_matches('"').to_string();
+                        let command = parts[1].trim().to_string();
+
+                        // Parse optional condition and close behavior
+                        let mut enabled_condition = None;
+                        let mut on_close_behavior = None;
+
+                        for part in parts.iter().skip(2) {
+                            let trimmed = part.trim();
+                            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                                enabled_condition = Some(
+                                    trimmed.trim_matches(|c| c == '{' || c == '}').to_string(),
+                                );
+                            } else {
+                                match trimmed.to_lowercase().as_str() {
+                                    "clickoncloseifenabled" => {
+                                        on_close_behavior =
+                                            Some(CommandButtonCloseAction::ClickOnCloseIfEnabled);
+                                    }
+                                    "clickoncloseifdisabled" => {
+                                        on_close_behavior =
+                                            Some(CommandButtonCloseAction::ClickOnCloseIfDisabled);
+                                    }
+                                    "clickonclose" => {
+                                        on_close_behavior =
+                                            Some(CommandButtonCloseAction::ClickOnClose);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        dialog.components.push(DialogComponent::CommandButton {
+                            label,
+                            command,
+                            enabled_condition,
+                            on_close_behavior,
+                        });
+                    }
+                }
+            }
+        }
+        "settingselector" => {
+            // Format: settingSelector = "Label" [, {visibility condition}]
+            // Followed by indented `settingOption` lines belonging to it.
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    if !parts.is_empty() {
+                        let label = parts[0].trim().trim_matches('"').to_string();
+                        let visibility_condition = parts
+                            .iter()
+                            .skip(1)
+                            .find(|p| p.trim().starts_with('{'))
+                            .map(|p| p.trim().trim_matches(|c| c == '{' || c == '}').to_string());
+                        dialog.components.push(DialogComponent::SettingSelector {
+                            label,
+                            options: Vec::new(),
+                            visibility_condition,
+                        });
+                    }
+                }
+            }
+        }
+        "settingoption" => {
+            // Format: settingOption = "Label", constName=value [, constName=value...]
+            // Only valid in a dialog when it immediately follows a
+            // `settingSelector` line — the `[SettingGroups]` `settingOption` is
+            // handled separately in `parse_setting_group_entry`.
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let selector_open = matches!(
+                        dialog.components.last(),
+                        Some(DialogComponent::SettingSelector { .. })
+                    );
+                    if !selector_open {
+                        tracing::warn!(
+                            "ini: settingOption outside a settingSelector block - dropped"
+                        );
+                        return;
+                    }
+                    let parts = split_ini_line(value);
+                    if let Some(first) = parts.first() {
+                        let label = first.trim().trim_matches('"').to_string();
+                        let mut assignments = Vec::new();
+                        for part in parts.iter().skip(1) {
+                            match part.split_once('=') {
+                                Some((k, v)) => match v.trim().parse::<f64>() {
+                                    Ok(value) => assignments.push(SettingAssignment {
+                                        name: k.trim().to_string(),
+                                        value,
+                                    }),
+                                    Err(_) => tracing::warn!(
+                                        "ini: settingOption assignment '{}' is not numeric - dropped",
+                                        part
+                                    ),
+                                },
+                                None => tracing::warn!(
+                                    "ini: settingOption part '{}' is not name=value - dropped",
+                                    part
+                                ),
+                            }
+                        }
+                        if let Some(DialogComponent::SettingSelector { options, .. }) =
+                            dialog.components.last_mut()
+                        {
+                            options.push(SettingSelectorOption { label, assignments });
+                        }
+                    }
+                }
+            }
+        }
+        "gauge" => {
+            if let Some(name) = current_dialog {
+                if let Some(dialog) = def.dialogs.get_mut(name) {
+                    let parts = split_ini_line(value);
+                    if !parts.is_empty() {
+                        let gauge_name = parts[0].trim().to_string();
+                        let position = parts
+                            .get(1)
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty());
+                        dialog.components.push(DialogComponent::Gauge {
+                            name: gauge_name,
+                            position,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse a [ControllerCommands] section entry
+/// Format: cmd_name = "command_string" or cmd_name = cmd_ref1, "raw_bytes", cmd_ref2, ...
+/// Command chaining: commands can reference other commands by name
+fn parse_controller_command_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let parts = split_ini_line(value);
+    if parts.is_empty() {
+        return;
+    }
+
+    let name = key.to_string();
+    let mut command_parts: Vec<CommandPart> = Vec::new();
+    let mut enable_condition = None;
+
+    for part in &parts {
+        let trimmed = part.trim();
+
+        // Check for enable condition (in braces)
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            enable_condition = Some(trimmed.trim_matches(|c| c == '{' || c == '}').to_string());
+            continue;
+        }
+
+        // Check if it's a quoted string (raw bytes) or a command reference
+        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+            // Raw command string with potential hex escapes
+            let raw = trimmed.trim_matches('"').to_string();
+            command_parts.push(CommandPart::Raw(raw));
+        } else if !trimmed.is_empty() {
+            // Command reference (another command name)
+            command_parts.push(CommandPart::Reference(trimmed.to_string()));
+        }
+    }
+
+    // If only one part and no parts parsed yet, it might be the old format "cmd_name = raw_string"
+    if command_parts.is_empty() && !parts.is_empty() {
+        command_parts.push(CommandPart::Raw(parts[0].trim_matches('"').to_string()));
+    }
+
+    // Use command name as label (no separate label in new format)
+    let label = name.clone();
+
+    def.controller_commands.insert(
+        name.clone(),
+        ControllerCommand {
+            name,
+            label,
+            parts: command_parts,
+            enable_condition,
+        },
+    );
+}
+
+/// Parse a [LoggerDefinition] section entry
+/// Format: logger_name = "Label", sample_rate, channel1, channel2, ... [, {enable_condition}]
+fn parse_logger_definition_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let parts = split_ini_line(value);
+    if parts.len() >= 3 {
+        let name = key.to_string();
+        let label = parts[0].trim_matches('"').to_string();
+        let sample_rate = parts[1].parse::<f64>().unwrap_or(100.0);
+
+        // Channels are all parts between sample_rate and optional condition
+        let mut channels = Vec::new();
+        let mut enable_condition = None;
+
+        for part in parts.iter().skip(2) {
+            let trimmed = part.trim();
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                enable_condition = Some(trimmed.trim_matches(|c| c == '{' || c == '}').to_string());
+                break;
+            } else {
+                channels.push(trimmed.to_string());
+            }
+        }
+
+        def.logger_definitions.insert(
+            name.clone(),
+            LoggerDefinition {
+                name,
+                label,
+                sample_rate,
+                channels,
+                enable_condition,
+            },
+        );
+    }
+}
+
+/// Parse a [PortEditor] section entry
+/// Format: port_name = "Label" [, {enable_condition}]
+fn parse_port_editor_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let parts = split_ini_line(value);
+    if !parts.is_empty() {
+        let name = key.to_string();
+        let label = parts[0].trim_matches('"').to_string();
+
+        // Optional enable condition (last part in braces)
+        let enable_condition = parts
+            .iter()
+            .skip(1)
+            .find(|p| {
+                let trimmed = p.trim();
+                trimmed.starts_with('{') && trimmed.ends_with('}')
+            })
+            .map(|p| p.trim().trim_matches(|c| c == '{' || c == '}').to_string());
+
+        def.port_editors.insert(
+            name.clone(),
+            PortEditorConfig {
+                name,
+                label,
+                enable_condition,
+            },
+        );
+    }
+}
+
+/// Strip surrounding double quotes from an INI field, leaving inner content
+/// (including deliberate whitespace, as in the blank `solution = " "` row).
+fn unquote(s: &str) -> String {
+    let t = s.trim();
+    t.strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(t)
+        .to_string()
+}
+
+/// Parse a `[ReferenceTables]` section.
+///
+/// This is a *block* section, not a flat key/value one — the earlier
+/// implementation treated every line as its own `name = "Label", table`
+/// record, which turned each sub-property (`adcCount`, `thermOption`,
+/// `solution`, …) into a bogus reference table of its own and dropped the
+/// actual calibration metadata on the floor. The real grammar is:
+///
+/// ```ini
+/// referenceTable  = std_ms2geno2, "Calibrate AFR Table..."
+///   topicHelp     = "https://..."
+///   tableIdentifier = 002, "AFR Table"
+///   tableLimits   = 000, -40, 350, 180
+///   adcCount      = 1024
+///   bytesPerAdc   = 1
+///   scale         = 10
+///   tableGenerator = linearGenerator, "Custom Linear WB", "Volts", "AFR", 1, 4, 9.7, 18.7
+///   thermOption   = "GM", 2490, -40, 100700, 30, 2238, 99, 177
+///   solutionsLabel = "EGO Sensor"
+///   solution      = "14Point7", { 10.0001 + (adcValue * 0.0097752) }
+///   solution      = "Custom Linear WB", linearGenerator
+/// ```
+///
+/// `tableLimits` lines may precede or follow the `tableIdentifier` they
+/// annotate, so they are stashed and applied when the block closes.
+fn parse_reference_table_entry(
+    def: &mut EcuDefinition,
+    key: &str,
+    value: &str,
+    current: &mut Option<String>,
+    pending_limits: &mut Vec<(u8, f64, f64, f64)>,
+) {
+    if key.eq_ignore_ascii_case("referenceTable") {
+        // A new block starts: flush limits collected for the previous one.
+        apply_pending_reference_limits(def, current, pending_limits);
+
+        let parts = split_ini_line(value);
+        if parts.is_empty() || parts[0].is_empty() {
+            return;
+        }
+        let name = parts[0].trim().to_string();
+        let label = parts.get(1).map(|s| unquote(s)).unwrap_or_default();
+        *current = Some(name.clone());
+        def.reference_tables.insert(
+            name.clone(),
+            ReferenceTable {
+                name,
+                label,
+                topic_help: None,
+                identifiers: Vec::new(),
+                // Speeduino always declares these; the defaults just keep a
+                // malformed block from producing a zero-length table.
+                adc_count: 0,
+                bytes_per_adc: 1,
+                scale: 1.0,
+                generators: Vec::new(),
+                therm_options: Vec::new(),
+                solutions_label: None,
+                solutions: Vec::new(),
+            },
+        );
+        return;
+    }
+
+    // Section-level properties; these precede the first block.
+    if key.eq_ignore_ascii_case("tableWriteCommand") {
+        def.table_write_command = Some(unquote(value));
+        return;
+    }
+    if key.eq_ignore_ascii_case("tableBlockingFactor") {
+        if let Ok(n) = value.trim().parse::<usize>() {
+            def.table_blocking_factor = Some(n);
+        }
+        return;
+    }
+
+    // `tableLimits` is recorded even before its identifier exists.
+    if key.eq_ignore_ascii_case("tableLimits") {
+        let parts = split_ini_line(value);
+        if parts.len() >= 4 {
+            if let (Ok(id), Ok(min), Ok(max), Ok(default)) = (
+                parts[0].trim().parse::<u8>(),
+                parts[1].trim().parse::<f64>(),
+                parts[2].trim().parse::<f64>(),
+                parts[3].trim().parse::<f64>(),
+            ) {
+                pending_limits.push((id, min, max, default));
+            }
+        }
+        return;
+    }
+
+    let Some(name) = current.clone() else { return };
+    let Some(table) = def.reference_tables.get_mut(&name) else {
+        return;
+    };
+
+    match key.to_ascii_lowercase().as_str() {
+        "topichelp" => table.topic_help = Some(unquote(value)),
+        "tableidentifier" => {
+            // One line may declare several: `000, "CLT", 001, "IAT"`.
+            let parts = split_ini_line(value);
+            for pair in parts.chunks(2) {
+                let Ok(id) = pair[0].trim().parse::<u8>() else {
+                    continue;
+                };
+                table.identifiers.push(CalibrationTableIdentifier {
+                    id,
+                    label: pair.get(1).map(|s| unquote(s)).unwrap_or_default(),
+                    limits: None,
+                });
+            }
+        }
+        "adccount" => {
+            if let Ok(n) = value.trim().parse::<usize>() {
+                table.adc_count = n;
+            }
+        }
+        "bytesperadc" => {
+            if let Ok(n) = value.trim().parse::<u8>() {
+                table.bytes_per_adc = n;
+            }
+        }
+        "scale" => {
+            if let Ok(n) = value.trim().parse::<f64>() {
+                table.scale = n;
+            }
+        }
+        "solutionslabel" => table.solutions_label = Some(unquote(value)),
+        "tablegenerator" => {
+            let parts = split_ini_line(value);
+            if parts.len() >= 2 {
+                let nums: Vec<f64> = parts
+                    .iter()
+                    .skip(4)
+                    .filter_map(|p| p.trim().parse::<f64>().ok())
+                    .collect();
+                table.generators.push(CalibrationGenerator {
+                    kind: parts[0].trim().to_string(),
+                    label: unquote(&parts[1]),
+                    x_units: parts.get(2).map(|s| unquote(s)),
+                    y_units: parts.get(3).map(|s| unquote(s)),
+                    bounds: if nums.len() >= 4 {
+                        Some((nums[0], nums[1], nums[2], nums[3]))
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+        "thermoption" => {
+            // name, biasResistor, t1, r1, t2, r2, t3, r3
+            let parts = split_ini_line(value);
+            if parts.len() >= 8 {
+                let nums: Option<Vec<f64>> = parts[1..8]
+                    .iter()
+                    .map(|p| p.trim().parse::<f64>().ok())
+                    .collect();
+                if let Some(n) = nums {
+                    table.therm_options.push(ThermistorOption {
+                        name: unquote(&parts[0]),
+                        bias_resistor: n[0],
+                        points: [(n[1], n[2]), (n[3], n[4]), (n[5], n[6])],
+                    });
+                }
+            }
+        }
+        "solution" => {
+            let parts = split_ini_line(value);
+            if parts.len() >= 2 {
+                let label = unquote(&parts[0]);
+                let body = parts[1].trim();
+                let solution =
+                    if let Some(expr) = body.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+                        CalibrationSolution::Expression {
+                            expression: expr.trim().to_string(),
+                        }
+                    } else {
+                        CalibrationSolution::Generator {
+                            generator: body.to_string(),
+                        }
+                    };
+                // The stock INI's leading `solution = " ", { }` is a spacer
+                // row for the dropdown; it would generate an all-zero table
+                // if a user ever picked it, so drop it here rather than
+                // making every consumer special-case it.
+                let is_blank_spacer = matches!(
+                    &solution,
+                    CalibrationSolution::Expression { expression } if expression.is_empty()
+                );
+                if !is_blank_spacer {
+                    table.solutions.push((label, solution));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Attach stashed `tableLimits` rows to the identifiers of the block that is
+/// closing (or, at end of section, the last one seen).
+fn apply_pending_reference_limits(
+    def: &mut EcuDefinition,
+    current: &Option<String>,
+    pending: &mut Vec<(u8, f64, f64, f64)>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    if let Some(table) = current
+        .as_ref()
+        .and_then(|n| def.reference_tables.get_mut(n))
+    {
+        for (id, min, max, default) in pending.iter() {
+            for ident in table.identifiers.iter_mut().filter(|i| i.id == *id) {
+                ident.limits = Some((*min, *max, *default));
+            }
+        }
+    }
+    pending.clear();
+}
+
+/// Parse a [FTPBrowser] section entry
+/// Format: browser_name = "Label", server, port [, {enable_condition}]
+fn parse_ftp_browser_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let parts = split_ini_line(value);
+    if parts.len() >= 3 {
+        let name = key.to_string();
+        let label = parts[0].trim_matches('"').to_string();
+        let server = parts[1].trim().to_string();
+        let port = parts[2].parse::<u16>().unwrap_or(21);
+
+        // Optional enable condition (last part in braces)
+        let enable_condition = parts
+            .iter()
+            .skip(3)
+            .find(|p| {
+                let trimmed = p.trim();
+                trimmed.starts_with('{') && trimmed.ends_with('}')
+            })
+            .map(|p| p.trim().trim_matches(|c| c == '{' || c == '}').to_string());
+
+        def.ftp_browsers.insert(
+            name.clone(),
+            FTPBrowserConfig {
+                name,
+                label,
+                server,
+                port,
+                enable_condition,
+            },
+        );
+    }
+}
+
+/// Parse a [DatalogViews] section entry
+/// Format: view_name = "Label", channel1, channel2, ...
+fn parse_datalog_view_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let parts = split_ini_line(value);
+    if parts.len() >= 2 {
+        let name = key.to_string();
+        let label = parts[0].trim_matches('"').to_string();
+        let channels: Vec<String> = parts.iter().skip(1).map(|s| s.trim().to_string()).collect();
+
+        def.datalog_views.insert(
+            name.clone(),
+            DatalogView {
+                name,
+                label,
+                channels,
+            },
+        );
+    }
+}
+
+/// Parse a [KeyActions] section entry
+/// Format: key = action, "Label" [, {enable_condition}]
+/// Or: showPanel = key, panel_name
+fn parse_key_action_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let parts = split_ini_line(value);
+    if key.eq_ignore_ascii_case("showPanel") && parts.len() >= 2 {
+        // Special case: showPanel = key, panel_name
+        let key_combo = parts[0].trim().to_string();
+        let action = format!("showPanel:{}", parts[1].trim());
+        let label = format!("Show {}", parts[1].trim());
+
+        def.key_actions.push(KeyAction {
+            key: key_combo,
+            action,
+            label,
+            enable_condition: None,
+        });
+    } else if parts.len() >= 2 {
+        // Format: key = action, "Label" [, {enable_condition}]
+        let key_combo = key.to_string();
+        let action = parts[0].trim().to_string();
+        let label = parts[1].trim_matches('"').to_string();
+
+        // Optional enable condition (last part in braces)
+        let enable_condition = parts
+            .iter()
+            .skip(2)
+            .find(|p| {
+                let trimmed = p.trim();
+                trimmed.starts_with('{') && trimmed.ends_with('}')
+            })
+            .map(|p| p.trim().trim_matches(|c| c == '{' || c == '}').to_string());
+
+        def.key_actions.push(KeyAction {
+            key: key_combo,
+            action,
+            label,
+            enable_condition,
+        });
+    }
+}
+
+/// Parse a VeAnalyze section entry
+fn parse_ve_analyze_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    // Initialize VeAnalyze config if not present
+    if def.ve_analyze.is_none() {
+        def.ve_analyze = Some(VeAnalyzeConfig::default());
+    }
+    let config = def.ve_analyze.as_mut().unwrap();
+
+    let key_lower = key.to_lowercase();
+    let parts = split_ini_line(value);
+
+    match key_lower.as_str() {
+        "veanalyzemap" => {
+            // veAnalyzeMap = veTableTbl, lambdaTableTbl, lambdaValue, egoCorrectionForVeAnalyze, { 1 }
+            //
+            // The fifth field, activeCondition, is OPTIONAL - Speeduino writes
+            // only four:
+            //   veAnalyzeMap = veTable1Tbl, afrTable1Tbl, afr, egoCorrection
+            //
+            // Requiring five discarded the entire declaration for every
+            // Speeduino INI, silently: no VE role, no AFR-target role, and
+            // AutoTune fell back to a flat 14.7 target for every cell. On a
+            // real drive that asked to pull ~15% fuel out of the WOT region,
+            // where the target table actually calls for 12.7.
+            if parts.len() >= 4 {
+                config.ve_table_name = parts[0].trim().to_string();
+                config.target_table_name = parts[1].trim().to_string();
+                config.lambda_channel = parts[2].trim().to_string();
+                config.ego_correction_channel = parts[3].trim().to_string();
+                config.active_condition = parts
+                    .get(4)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+            }
+        }
+        "lambdatargettables" => {
+            // lambdaTargetTables = lambdaTableTbl, afrTSCustom
+            config.lambda_target_tables = parts.iter().map(|s| s.trim().to_string()).collect();
+        }
+        "filter" => {
+            if let Some(filter) = parse_analysis_filter(value) {
+                config.filters.push(filter);
+            }
+        }
+        "option" => {
+            config.options.push(value.trim().to_string());
+        }
+        _ => {}
+    }
+}
+
+/// Parse a WueAnalyze section entry
+fn parse_wue_analyze_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    // Initialize WueAnalyze config if not present
+    if def.wue_analyze.is_none() {
+        def.wue_analyze = Some(WueAnalyzeConfig::default());
+    }
+    let config = def.wue_analyze.as_mut().unwrap();
+
+    let key_lower = key.to_lowercase();
+    let parts = split_ini_line(value);
+
+    match key_lower.as_str() {
+        "wueanalyzemap" => {
+            // wueAnalyzeMap = wueCurveName, afrTempCompCurve, targetTableName, lambdaChannel, coolantChannel, wueChannel, egoCorrectionChannel
+            if parts.len() >= 7 {
+                config.wue_curve_name = parts[0].trim().to_string();
+                config.afr_temp_comp_curve = parts[1].trim().to_string();
+                config.target_table_name = parts[2].trim().to_string();
+                config.lambda_channel = parts[3].trim().to_string();
+                config.coolant_channel = parts[4].trim().to_string();
+                config.wue_channel = parts[5].trim().to_string();
+                config.ego_correction_channel = parts[6].trim().to_string();
+            }
+        }
+        "lambdatargettables" => {
+            config.lambda_target_tables = parts.iter().map(|s| s.trim().to_string()).collect();
+        }
+        "wuepercentoffset" => {
+            config.wue_percent_offset = value.trim().parse().unwrap_or(0.0);
+        }
+        "filter" => {
+            if let Some(filter) = parse_analysis_filter(value) {
+                config.filters.push(filter);
+            }
+        }
+        "option" => {
+            config.options.push(value.trim().to_string());
+        }
+        _ => {}
+    }
+}
+
+/// Parse a GammaE section entry
+fn parse_gamma_e_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    // Initialize GammaE config if not present
+    if def.gamma_e.is_none() {
+        def.gamma_e = Some(GammaEConfig::default());
+    }
+    let config = def.gamma_e.as_mut().unwrap();
+
+    let key_lower = key.to_lowercase();
+    let parts = split_ini_line(value);
+
+    match key_lower.as_str() {
+        "gammaemap" | "gammaetable" => {
+            // gammaETable = gammaTableTbl, lambdaChannel, targetTableName
+            if parts.len() >= 3 {
+                config.gamma_table_name = parts[0].trim().to_string();
+                config.lambda_channel = parts[1].trim().to_string();
+                config.target_table_name = parts[2].trim().to_string();
+            }
+        }
+        "filter" => {
+            if let Some(filter) = parse_analysis_filter(value) {
+                config.filters.push(filter);
+            }
+        }
+        "option" => {
+            config.options.push(value.trim().to_string());
+        }
+        _ => {}
+    }
+}
+
+/// Parse an analysis filter line
+/// Format: filter = name, "Display Name", channel, operator, defaultValue, userAdjustable
+/// Or: filter = std_Custom (standard custom filter)
+fn parse_analysis_filter(value: &str) -> Option<AnalysisFilter> {
+    let parts = split_ini_line(value);
+
+    // Handle standard filters like "std_Custom", "std_DeadLambda"
+    if parts.len() == 1 {
+        let name = parts[0].trim();
+        if name.starts_with("std_") {
+            return Some(AnalysisFilter {
+                name: name.to_string(),
+                display_name: name.to_string(),
+                channel: String::new(),
+                operator: FilterOperator::Equal,
+                default_value: 0.0,
+                user_adjustable: false,
+            });
+        }
+        return None;
+    }
+
+    // Full filter format: name, "displayName", channel, operator, defaultValue, userAdjustable
+    if parts.len() >= 5 {
+        let name = parts[0].trim().to_string();
+        let display_name = parts[1].trim().trim_matches('"').to_string();
+        let channel = parts[2].trim().to_string();
+        let operator = FilterOperator::from_str(parts[3].trim()).unwrap_or(FilterOperator::Equal);
+        let default_value = parts[4].trim().parse().unwrap_or(0.0);
+        // The documented form is six fields, but the real one is seven: a blank
+        // slot sits between the default value and the flag.
+        //
+        //   filter = minCltFilter, "Minimum CLT", coolant, <, 71, , true
+        //
+        // Reading a fixed parts[5] therefore found the blank and every filter
+        // in the shipping INI parsed as not user-adjustable. The test fixture
+        // used the six-field form, so it agreed with the bug. Scan for the
+        // first field that actually has something in it instead, which handles
+        // both shapes.
+        let user_adjustable = parts
+            .get(5..)
+            .unwrap_or(&[])
+            .iter()
+            .find(|s| !s.trim().is_empty())
+            .is_some_and(|s| parse_ini_bool(s));
+
+        return Some(AnalysisFilter {
+            name,
+            display_name,
+            channel,
+            operator,
+            default_value,
+            user_adjustable,
+        });
+    }
+
+    None
+}
+
+/// Parse [ConstantsExtensions] section entries
+/// Handles:
+/// - defaultValue = name, value1 value2 value3 ... (sets default array values for constants)
+/// - maintainConstantValue = name, { expression } (auto-update expressions)
+/// - requiresPowerCycle = name (mark constant as requiring ECU power cycle)
+fn parse_constants_extensions_entry(def: &mut EcuDefinition, key: &str, value: &str) {
+    let key_lower = key.to_lowercase();
+
+    match key_lower.as_str() {
+        "defaultvalue" => {
+            // Format: defaultValue = constName, val1 val2 val3 ...
+            // or: defaultValue = constName, val
+            let parts = split_ini_line(value);
+            if parts.len() >= 2 {
+                let const_name = parts[0].trim().to_string();
+                // The rest is space-separated values (for arrays) or a single value
+                let values_str = parts[1..].join(",");
+                // Store in default_values as f64 (for single values) or parse array
+                // For now, parse the first value as f64 for simple scalar defaults
+                let value_parts: Vec<&str> = values_str.split_whitespace().collect();
+                if let Some(first) = value_parts.first() {
+                    if let Ok(val) = first.trim().parse::<f64>() {
+                        def.default_values.insert(const_name, val);
+                    }
+                }
+            }
+        }
+        "maintainconstantvalue" => {
+            // Format: maintainConstantValue = constName, { expression }
+            // The expression auto-updates the constant value
+            if let Some(brace_start) = value.find('{') {
+                if let Some(brace_end) = value.rfind('}') {
+                    let const_name = value[..brace_start]
+                        .trim_end_matches(',')
+                        .trim()
+                        .to_string();
+                    let expression = value[brace_start + 1..brace_end].trim().to_string();
+
+                    def.maintain_constant_values.push(MaintainConstantValue {
+                        constant_name: const_name,
+                        expression,
+                    });
+                }
+            }
+        }
+        "maximumelements" => {
+            // Format: maximumElements = arrayName, cellCount
+            let parts = split_ini_line(value);
+            if parts.len() >= 2 {
+                let name = parts[0].trim().to_string();
+                if let Ok(n) = parts[1].trim().parse::<usize>() {
+                    def.maximum_elements.insert(name, n);
+                }
+            }
+        }
+        "requirespowercycle" => {
+            // Format: requiresPowerCycle = constName
+            let const_name = value.trim().to_string();
+            if !const_name.is_empty() {
+                def.requires_power_cycle.push(const_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// An INI picks metric units with `#if CELSIUS`. TunerStudio defines that
+    /// from the project's `ecuSettings`; nothing carried it into LibreTune, so
+    /// the Fahrenheit `#else` arm always won and a 23 degC cold start read 73
+    /// on the gauge under a generic "TEMP" label.
+    ///
+    /// Serialized against [`a_definition_remembers_the_symbols_it_was_parsed_with`]:
+    /// both tests toggle the process-wide `DEFAULT_SYMBOLS` seed, and cargo
+    /// runs tests in parallel by default, so without this they can interleave
+    /// and flip each other's seed between `set_default_symbols` and `parse_ini`.
+    #[test]
+    #[serial(default_symbols)]
+    fn celsius_symbol_selects_the_metric_branch() {
+        let ini = concat!(
+            "[Constants]
+",
+            "page = 1
+",
+            "#if CELSIUS
+",
+            "tempTest = scalar, U08, 0, \"C\", 1.0, -40, -40, 102.0, 0
+",
+            "#else
+",
+            "tempTest = scalar, U08, 0, \"F\", 1.8, -22.23, -40, 215.0, 0
+",
+            "#endif
+"
+        );
+
+        set_default_symbols(Vec::<String>::new());
+        let f = parse_ini(ini).expect("parses");
+        assert_eq!(
+            f.constants.get("tempTest").map(|c| c.units.as_str()),
+            Some("F"),
+            "without the symbol the Fahrenheit branch is taken"
+        );
+
+        set_default_symbols(vec!["CELSIUS".to_string()]);
+        let c = parse_ini(ini).expect("parses");
+        assert_eq!(
+            c.constants.get("tempTest").map(|c| c.units.as_str()),
+            Some("C"),
+            "seeding CELSIUS must select the metric branch"
+        );
+        set_default_symbols(Vec::<String>::new());
+    }
+
+    /// A definition records which arm of every `#if` it took, so a later
+    /// change to the seed cannot move the answer underneath it.
+    ///
+    /// The gauge label is rendered from this ("TEMP" becomes degC or degF)
+    /// while the value comes from arithmetic baked in at parse time. When the
+    /// label was read from the process-wide seed instead, saving the units
+    /// preference mid-session relabelled every temperature to degC while it
+    /// went on computing Fahrenheit - a gauge reading 176 degC for an 80 degC
+    /// coolant, which is worse than being imperial throughout because it looks
+    /// plausible. Keeping the answer on the definition also means this holds
+    /// with other parses running concurrently.
+    #[test]
+    #[serial(default_symbols)]
+    fn a_definition_remembers_the_symbols_it_was_parsed_with() {
+        let ini = "[Constants]
+page = 1
+#if CELSIUS
+tempTest = scalar, U08, 0, \"C\", 1.0, -40, -40, 102.0, 0
+#else
+tempTest = scalar, U08, 0, \"F\", 1.8, -22.23, -40, 215.0, 0
+#endif
+";
+
+        set_default_symbols(vec!["CELSIUS".to_string()]);
+        let celsius_def = parse_ini(ini).expect("parses");
+        assert_eq!(
+            celsius_def
+                .constants
+                .get("tempTest")
+                .map(|c| c.units.as_str()),
+            Some("C")
+        );
+        assert!(celsius_def.symbol_is_active("CELSIUS"));
+
+        // Change the seed WITHOUT reparsing, exactly as saving the units
+        // setting does. The definition already loaded is still the Celsius one
+        // and must keep saying so - that is what keeps its labels honest.
+        set_default_symbols(Vec::<String>::new());
+        assert!(
+            celsius_def.symbol_is_active("CELSIUS"),
+            "a loaded definition does not change units because a setting did"
+        );
+
+        // Reparsing is what makes the new seed take effect.
+        let imperial_def = parse_ini(ini).expect("parses");
+        assert_eq!(
+            imperial_def
+                .constants
+                .get("tempTest")
+                .map(|c| c.units.as_str()),
+            Some("F")
+        );
+        assert!(!imperial_def.symbol_is_active("CELSIUS"));
+        // ...and the older definition is untouched by it.
+        assert!(celsius_def.symbol_is_active("CELSIUS"));
+    }
+
+    /// Speeduino's `veAnalyzeMap` has four fields, not five.
+    ///
+    /// The fifth (activeCondition) is optional and Speeduino omits it, but the
+    /// parser required it - so the whole declaration was dropped and every
+    /// table kept `TableRole::Other`. AutoTune then could not find the AFR
+    /// target table, fell back to a flat 14.7 for every cell, and on a real
+    /// drive recommended pulling ~15% fuel out of the WOT region where the
+    /// target table asks for 12.7. On an engine without knock detection that
+    /// is an engine-damage bug, so it is pinned with the real INI's own text.
+    #[test]
+    fn ve_analyze_map_parses_speeduinos_four_field_form() {
+        let ini = "[TableEditor]
+table = veTable1Tbl, veTable1, \"VE Table\", 2
+table = afrTable1Tbl, afrTable1, \"AFR Table\", 2
+[VeAnalyze]
+veAnalyzeMap = veTable1Tbl, afrTable1Tbl, afr, egoCorrection
+";
+        let def = parse_ini(ini).expect("parses");
+        let cfg = def.ve_analyze.as_ref().expect("VeAnalyze config present");
+        assert_eq!(cfg.ve_table_name, "veTable1Tbl");
+        assert_eq!(cfg.target_table_name, "afrTable1Tbl");
+        assert_eq!(cfg.lambda_channel, "afr");
+        assert_eq!(cfg.ego_correction_channel, "egoCorrection");
+        assert_eq!(
+            cfg.active_condition, "",
+            "absent optional field stays empty"
+        );
+    }
+
+    /// Roles must be inferred by the time a caller sees the definition.
+    ///
+    /// `infer_table_roles()` was correct but called from nowhere, so every
+    /// table stayed `Other` and the AFR-target lookup could never succeed for
+    /// any INI. The fallback it dropped into guesses by name from a list
+    /// containing both `afrTable` and `lambdaTable` - which on a lambda INI
+    /// compares a ~0.88 target against a ~13 measured AFR.
+    #[test]
+    fn parsing_assigns_table_roles() {
+        let ini = "[TableEditor]
+table = veTable1Tbl, veTable1, \"VE Table\", 2
+table = afrTable1Tbl, afrTable1, \"AFR Table\", 2
+table = sparkTbl, spark, \"Spark Table\", 2
+[VeAnalyze]
+veAnalyzeMap = veTable1Tbl, afrTable1Tbl, afr, egoCorrection
+";
+        let def = parse_ini(ini).expect("parses");
+        let role = |n: &str| {
+            def.tables
+                .values()
+                .find(|t| t.name == n)
+                .map(|t| t.role)
+                .unwrap_or(crate::ini::TableRole::Other)
+        };
+        assert_eq!(role("veTable1Tbl"), crate::ini::TableRole::Ve);
+        assert_eq!(role("afrTable1Tbl"), crate::ini::TableRole::AfrTarget);
+        assert_eq!(role("sparkTbl"), crate::ini::TableRole::Ignition);
+    }
+
+    /// Dual-table INIs define a numbered family (`veTable1Tbl`,
+    /// `veTable2Tbl`, …) but `[VeAnalyze]` names only the first, since the
+    /// analyzer runs one table at a time. The siblings used to fall through
+    /// to `Other`, so the fuel-tune guard refused them and the AutoTune
+    /// pickers no longer offered the second VE table (issue #132).
+    #[test]
+    fn numbered_siblings_inherit_the_labeled_role() {
+        let ini = "[TableEditor]
+table = veTable1Tbl, veTable1, \"VE Table 1\", 2
+table = veTable2Tbl, veTable2, \"VE Table 2\", 2
+table = afrTable1Tbl, afrTable1, \"AFR Table 1\", 2
+table = afrTable2Tbl, afrTable2, \"AFR Table 2\", 2
+table = veTableMafTbl, veTableMaf, \"MAF trim\", 2
+table = sparkTbl, spark, \"Spark Table\", 2
+[VeAnalyze]
+veAnalyzeMap = veTable1Tbl, afrTable1Tbl, afr, egoCorrection
+";
+        let def = parse_ini(ini).expect("parses");
+        let role = |n: &str| {
+            def.tables
+                .values()
+                .find(|t| t.name == n)
+                .map(|t| t.role)
+                .unwrap_or(crate::ini::TableRole::Other)
+        };
+        assert_eq!(role("veTable1Tbl"), crate::ini::TableRole::Ve);
+        assert_eq!(
+            role("veTable2Tbl"),
+            crate::ini::TableRole::Ve,
+            "numbered sibling of the labeled VE table"
+        );
+        assert_eq!(role("afrTable1Tbl"), crate::ini::TableRole::AfrTarget);
+        assert_eq!(role("afrTable2Tbl"), crate::ini::TableRole::AfrTarget);
+        assert_eq!(
+            role("veTableMafTbl"),
+            crate::ini::TableRole::Other,
+            "no number to vary, and the INI does not label it"
+        );
+        assert_eq!(role("sparkTbl"), crate::ini::TableRole::Ignition);
+    }
+
+    /// Speeduino declares these in `[Constants]`, where the section parser had
+    /// no arm for either — `delayAfterPortOpen` stayed 0 (handshake raced the
+    /// port open) and `tsWriteBlocks` was never matched at all because only the
+    /// bare `writeBlocks` spelling was handled.
+    #[test]
+    fn constants_section_parses_port_open_delay_and_ts_write_blocks() {
+        let mut def = EcuDefinition::default();
+        let (mut page, mut offset) = (0u8, 0u16);
+
+        assert_eq!(def.protocol.delay_after_port_open, 0, "default is 0");
+        parse_constants_entry(
+            &mut def,
+            "delayAfterPortOpen",
+            "1000 ; let the board settle",
+            &mut page,
+            &mut offset,
+        );
+        assert_eq!(def.protocol.delay_after_port_open, 1000);
+
+        def.protocol.write_blocks = false;
+        parse_constants_entry(&mut def, "tsWriteBlocks", "on", &mut page, &mut offset);
+        assert!(
+            def.protocol.write_blocks,
+            "tsWriteBlocks spelling must match"
+        );
+    }
+
+    #[test]
+    fn test_strip_comment() {
+        // Comments after equals sign
+        assert_eq!(strip_comment("key = value ; comment"), "key = value ");
+
+        // Semicolons in quotes are preserved
+        assert_eq!(
+            strip_comment("key = \"value ; with semi\""),
+            "key = \"value ; with semi\""
+        );
+
+        // Note: # is now handled at the line level for preprocessor directives,
+        // so strip_comment doesn't remove # comment lines anymore
+        assert_eq!(strip_comment("# comment line"), "# comment line");
+
+        // NEW: Semicolons in field names (before =) are preserved for help text
+        assert_eq!(
+            strip_comment("fieldname;+help text = value"),
+            "fieldname;+help text = value"
+        );
+
+        // But comments after = are still stripped
+        assert_eq!(
+            strip_comment("fieldname;+help = value ; comment"),
+            "fieldname;+help = value "
+        );
+    }
+
+    #[test]
+    fn test_parse_key_value() {
+        assert_eq!(parse_key_value("key = value"), Some(("key", "value")));
+        assert_eq!(parse_key_value("key=value"), Some(("key", "value")));
+        assert_eq!(parse_key_value("no equals"), None);
+    }
+
+    #[test]
+    fn test_parse_basic_ini() {
+        let content = r#"
+[MegaTune]
+signature = "speeduino 202310"
+queryCommand = "Q"
+versionInfo = "Speeduino 2023.10"
+
+[TunerStudio]
+iniSpecVersion = 3.64
+nPages = 2
+pageSize = 288, 128
+
+[Constants]
+page = 1
+reqFuel = scalar, U16, 0, "ms", 0.1, 0.0, 0, 25.5, 1
+
+[OutputChannels]
+rpm = U16, 0, "RPM", 1.0, 0.0
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        assert_eq!(def.signature, "speeduino 202310");
+        assert_eq!(def.query_command, "Q");
+        assert_eq!(def.n_pages, 2);
+        assert_eq!(def.page_sizes, vec![288, 128]);
+
+        // Verify page normalization: INI page = 1 should be stored as page 0 internally
+        let req_fuel = def.constants.get("reqFuel").expect("reqFuel should exist");
+        assert_eq!(
+            req_fuel.page, 0,
+            "INI 'page = 1' should be normalized to internal page 0"
+        );
+
+        assert!(def.constants.contains_key("reqFuel"));
+        assert!(def.output_channels.contains_key("rpm"));
+    }
+
+    #[test]
+    fn test_parse_max_unused_runtime_range() {
+        let content = r#"
+[TunerStudio]
+maxUnusedRuntimeRange = 42
+"#;
+        let def = parse_ini(content).expect("Should parse successfully");
+        assert_eq!(def.protocol.max_unused_runtime_range, 42);
+    }
+
+    #[test]
+    fn indicator_panel_without_a_columns_count_still_registers() {
+        // Verbatim shape from a real rusEFI INI: indicatorPanel omitting the
+        // `, columns` parameter (unlike its sibling panels, which all give
+        // one) used to be silently dropped entirely — `columns` was treated
+        // as required, not optional as its own doc comment claimed. Losing
+        // the panel also stranded its `indicator =` lines: with
+        // current_indicator_panel never set, they fell through to the
+        // "attach to current_dialog" fallback and landed as bare fields on
+        // whatever dialog was last opened, instead of on this panel.
+        let content = r#"
+[UserDefined]
+	dialog = someOtherDialog, "Unrelated"
+		field = "Unrelated field", someConstant
+
+	indicatorPanel = fuelClosedLoopIndicatorsPanel
+		indicator = { stftCorrectionState != 0 }, { Correction using bitStringValue(stftBinIdxList, stftCorrectionBinIdx) region }, { Not active: bitStringValue(stftStateList, stftCorrectionState) }, green, black, white, black
+		indicator = { isTuningNow }, "No tuning happening", "Tuning Detected", white, black, green, black
+"#;
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        let panel = def
+            .indicator_panels
+            .get("fuelClosedLoopIndicatorsPanel")
+            .expect("panel should be registered even without an explicit columns count");
+        assert_eq!(panel.columns, 2, "missing columns should default to 2");
+        assert_eq!(panel.indicators.len(), 2);
+        assert_eq!(
+            panel.indicators[1].label_on, "Tuning Detected",
+            "indicator lines after a columns-less panel header must attach to that panel"
+        );
+
+        // The earlier dialog must not have picked up these indicators as
+        // stray fields — that was the visible symptom (they rendered as
+        // unstyled bullet rows with the raw, unevaluated expression text).
+        let other_dialog = def
+            .dialogs
+            .get("someOtherDialog")
+            .expect("dialog should exist");
+        assert_eq!(
+            other_dialog.components.len(),
+            1,
+            "only the field explicitly declared in this dialog should be on it"
+        );
+    }
+
+    #[test]
+    fn dialog_captures_its_layout_hint() {
+        // TunerStudio's "Short term fuel trim/Closed loop" dialog uses
+        // exactly this: dialog = name, "title", xAxis to lay its child
+        // panels out in a row instead of stacking them.
+        let content = r#"
+[UserDefined]
+	dialog = fuelClosedLoopDialog, "Short term fuel trim/Closed loop", xAxis
+		panel = fuelClosedLoopBank1
+
+	dialog = plainDialog, "No hint"
+		field = "Label", someConstant
+"#;
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        let with_hint = def
+            .dialogs
+            .get("fuelClosedLoopDialog")
+            .expect("dialog should exist");
+        assert_eq!(with_hint.layout_hint.as_deref(), Some("xAxis"));
+
+        let without_hint = def.dialogs.get("plainDialog").expect("dialog should exist");
+        assert_eq!(without_hint.layout_hint, None);
+    }
+
+    #[test]
+    fn test_parse_rusefi_ini() {
+        let path = "/home/pat/.gemini/antigravity/scratch/libretune/definitions/rusEFI2025062101.2025.06.22.epicECU.1005735475.ini";
+        if std::path::Path::new(path).exists() {
+            let content = std::fs::read_to_string(path).expect("Should read file");
+            let def = parse_ini(&content).expect("Should parse successfully");
+
+            // Check for a specific table
+            assert!(
+                def.tables.contains_key("ignitionTableTbl")
+                    || def.tables.contains_key("ignitionTable")
+            );
+
+            // Check for menus
+            assert!(!def.menus.is_empty());
+            assert!(def.menus.iter().any(|m| m.title.contains("Fuel")));
+
+            // Check for dialogs
+            assert!(!def.dialogs.is_empty());
+            assert!(def.dialogs.contains_key("fuel_computerDialog"));
+        }
+    }
+
+    #[test]
+    fn test_substitute_variables() {
+        use std::collections::HashMap;
+
+        let mut vars = HashMap::new();
+        vars.insert("tsCanId".to_string(), 0u8);
+
+        // Test simple substitution (unescaped $)
+        assert_eq!(substitute_variables("$tsCanId\\x04", &vars), "\x00\\x04");
+
+        // Test escaped \$ substitution (common in INI files)
+        assert_eq!(substitute_variables(r"\$tsCanId\x04", &vars), "\x00\\x04");
+
+        // Test substitution at end of string
+        assert_eq!(substitute_variables("prefix$tsCanId", &vars), "prefix\x00");
+        assert_eq!(
+            substitute_variables(r"prefix\$tsCanId", &vars),
+            "prefix\x00"
+        );
+
+        // Test unknown variable preserved
+        assert_eq!(substitute_variables("$unknownVar", &vars), "$unknownVar");
+        assert_eq!(
+            substitute_variables(r"\$unknownVar", &vars),
+            r"\$unknownVar"
+        );
+
+        // Test no variables
+        assert_eq!(
+            substitute_variables("no variables here", &vars),
+            "no variables here"
+        );
+
+        // Test with different CAN ID value
+        vars.insert("tsCanId".to_string(), 5u8);
+        assert_eq!(substitute_variables("$tsCanId\\x04", &vars), "\x05\\x04");
+        assert_eq!(substitute_variables(r"\$tsCanId\x04", &vars), "\x05\\x04");
+    }
+
+    #[test]
+    fn test_pc_variables_parsing() {
+        let content = r#"
+[PcVariables]
+tsCanId = bits, U08, [0:3], "CAN ID 0", "CAN ID 1", "CAN ID 2"
+
+[Constants]
+pageIdentifier = "\$tsCanId\x04", "\$tsCanId\x05"
+pageReadCommand = "r%2i%2o%2c", "r%2i%2o%2c"
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        // Check that tsCanId was parsed with default value 0
+        assert_eq!(def.pc_variables.get("tsCanId"), Some(&0u8));
+
+        // Check that page identifiers have $tsCanId substituted with 0x00
+        // "\$tsCanId\x04" -> "\x00\x04" -> bytes [0, 4]
+        assert_eq!(def.protocol.page_identifiers.len(), 2);
+        assert_eq!(def.protocol.page_identifiers[0], vec![0u8, 4u8]);
+        assert_eq!(def.protocol.page_identifiers[1], vec![0u8, 5u8]);
+    }
+
+    #[test]
+    fn test_query_command_substitution() {
+        let content = r#"
+[MegaTune]
+queryCommand = "r\$tsCanId\x0f\x00\x00\x00\x14"
+
+[PcVariables]
+tsCanId = bits, U08, [0:3], "CAN ID 0", "CAN ID 1"
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        // queryCommand should have $tsCanId replaced with 0x00
+        // "r\$tsCanId\x0f..." -> "r\x00\x0f..."
+        assert!(def.query_command.starts_with("r\x00"));
+    }
+
+    #[test]
+    fn test_ms2extra_ini_parsing() {
+        // Test with actual MS2Extra INI file if available
+        let path =
+            "/home/pat/codingprojects/libretune/TunerStudioMS/config/ecuDef/MS2Extracomms342hU.ini";
+        if std::path::Path::new(path).exists() {
+            // Use EcuDefinition::from_file which handles encoding
+            let def =
+                crate::ini::EcuDefinition::from_file(path).expect("Should parse successfully");
+
+            // Check that tsCanId was parsed
+            assert!(
+                def.pc_variables.contains_key("tsCanId"),
+                "tsCanId should be in pc_variables"
+            );
+            assert_eq!(
+                def.pc_variables.get("tsCanId"),
+                Some(&0u8),
+                "tsCanId should default to 0"
+            );
+
+            // Check that page identifiers have been substituted
+            // With tsCanId=0, pageIdentifier "\$tsCanId\x04" should become bytes [0, 4]
+            assert!(
+                !def.protocol.page_identifiers.is_empty(),
+                "Should have page identifiers"
+            );
+
+            // First page identifier should start with 0x00 (the substituted tsCanId value)
+            let first_id = &def.protocol.page_identifiers[0];
+            assert!(
+                !first_id.is_empty(),
+                "First page identifier should not be empty"
+            );
+            assert_eq!(
+                first_id[0], 0x00,
+                "First byte should be substituted tsCanId value (0)"
+            );
+
+            // Check that pageReadCommand was parsed and substituted
+            assert!(
+                !def.protocol.page_read_commands.is_empty(),
+                "Should have page read commands"
+            );
+            let first_cmd = &def.protocol.page_read_commands[0];
+            // Should start with 'r' followed by 0x00 (substituted tsCanId)
+            assert!(
+                first_cmd.starts_with("r\x00"),
+                "Page read command should have tsCanId substituted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_preprocessor_conditionals() {
+        // Test that #set/#if/#else/#endif are handled correctly
+        let content = r#"
+#set CAN_COMMANDS
+
+[MegaTune]
+signature = "TestECU"
+#if CAN_COMMANDS
+   queryCommand = "r\x00\x0f\x00\x00\x00\x14"
+#else
+   queryCommand = "Q"
+#endif
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        // With CAN_COMMANDS set, should use the modern CRC command, not "Q"
+        assert!(
+            !def.query_command.starts_with("Q"),
+            "Should use CAN command, not legacy Q"
+        );
+        assert!(
+            def.query_command.starts_with("r"),
+            "Should start with 'r' for read command"
+        );
+    }
+
+    #[test]
+    fn test_preprocessor_else_branch() {
+        // Test that #else branch is used when symbol is not set
+        let content = r#"
+[MegaTune]
+signature = "TestECU"
+#if CAN_COMMANDS
+   queryCommand = "r\x00\x0f\x00\x00\x00\x14"
+#else
+   queryCommand = "Q"
+#endif
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        // Without CAN_COMMANDS set, should use the legacy "Q" command
+        assert_eq!(
+            def.query_command, "Q",
+            "Should use legacy Q command when symbol not set"
+        );
+    }
+
+    #[test]
+    fn test_preprocessor_unset() {
+        // Test that #unset works
+        let content = r#"
+#set FEATURE
+#unset FEATURE
+
+[MegaTune]
+signature = "TestECU"
+#if FEATURE
+   queryCommand = "enabled"
+#else
+   queryCommand = "disabled"
+#endif
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        // FEATURE was set then unset, so should use else branch
+        assert_eq!(
+            def.query_command, "disabled",
+            "Should use else branch after #unset"
+        );
+    }
+
+    #[test]
+    fn test_conditional_section_header_active() {
+        // Spec §A.2: `[Section &symbol]` is parsed when `symbol` is `#set`.
+        let content = r#"
+#set EXTRA_TUNERSTUDIO
+
+[MegaTune]
+signature = "BaseECU"
+
+[TunerStudio &EXTRA_TUNERSTUDIO]
+signature = "OverrideECU"
+"#;
+        let def = parse_ini(content).expect("Should parse successfully");
+        // Conditional section was active; its `signature` overrode the base.
+        assert_eq!(def.signature, "OverrideECU");
+    }
+
+    #[test]
+    fn test_conditional_section_header_suppressed() {
+        // When the gate symbol isn't defined, the section is suppressed entirely.
+        let content = r#"
+[MegaTune]
+signature = "BaseECU"
+
+[TunerStudio &EXTRA_TUNERSTUDIO]
+signature = "OverrideECU"
+"#;
+        let def = parse_ini(content).expect("Should parse successfully");
+        assert_eq!(def.signature, "BaseECU");
+    }
+
+    #[test]
+    fn test_conditional_section_header_negation() {
+        // `&!symbol` activates the section only when `symbol` is NOT defined.
+        let content = r#"
+[MegaTune]
+signature = "BaseECU"
+
+[TunerStudio &!CAN_COMMANDS]
+signature = "NoCanECU"
+"#;
+        let def = parse_ini(content).expect("Should parse successfully");
+        assert_eq!(def.signature, "NoCanECU");
+    }
+
+    #[test]
+    fn test_table_size_resolution() {
+        // Test that post_process_table_sizes resolves table dimensions from constants
+        let content = r#"
+[MegaTune]
+signature = "TestECU"
+
+[Constants]
+page = 1
+   veRpmBins = array, U08, 0, [16], "RPM", 100.0, 0.0
+   veFuelBins = array, U08, 16, [16], "%", 1.0, 0.0
+   veTable = array, U08, 32, [16x16], "%", 1.0, 0.0
+
+[TableEditor]
+table = veTable1, veTableMap, "VE Table 1"
+  xBins = veRpmBins
+  yBins = veFuelBins
+  zBins = veTable
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        // Check that the table was parsed
+        assert!(
+            def.tables.contains_key("veTable1"),
+            "veTable1 should be parsed"
+        );
+
+        let table = def.tables.get("veTable1").unwrap();
+
+        // Check that x_size and y_size were resolved from the constant shapes
+        assert_eq!(table.x_size, 16, "x_size should be 16 from veRpmBins");
+        assert_eq!(table.y_size, 16, "y_size should be 16 from veFuelBins");
+    }
+
+    #[test]
+    fn test_dynamic_table_shape_resolution() {
+        let content = r#"
+[MegaTune]
+signature = "epicECU test"
+iniSpecVersion = 3.53
+
+[Constants]
+page = 1
+   veTableRows = scalar, U08, 0, "", 1.0, 0, 8, 32, 0
+   veTableCols = scalar, U08, 1, "", 1.0, 0, 8, 32, 0
+   veTable = array, U16, 2, [{veTableCols}x{veTableRows}], "%", 0.01, 0, 0, 650, 2
+   veLoadBins = array, U16, 514, [{veTableRows}], "kPa", 1, 0, 0, 650, 0
+   veRpmBins = array, U16, 578, [{veTableCols}], "RPM", 1, 0, 0, 32000, 0
+
+[ConstantsExtensions]
+   defaultValue = veTableRows, 16
+   defaultValue = veTableCols, 16
+   maximumElements = veTable, 256
+
+[TableEditor]
+table = veTable1, veTableMap, "VE Table"
+  xBins = veRpmBins
+  yBins = veLoadBins
+  zBins = veTable
+"#;
+
+        let def = parse_ini(content).expect("Should parse dynamic table INI");
+        let ve = def.constants.get("veTable").expect("veTable");
+        assert!(ve.dynamic_size.is_some());
+        assert_eq!(ve.shape.element_count(), 256);
+        assert_eq!(
+            def.constants
+                .get("veLoadBins")
+                .unwrap()
+                .shape
+                .element_count(),
+            32
+        );
+        assert_eq!(
+            def.constants
+                .get("veRpmBins")
+                .unwrap()
+                .shape
+                .element_count(),
+            32
+        );
+
+        let table = def.tables.get("veTable1").unwrap();
+        assert_eq!(table.x_size, 16);
+        assert_eq!(table.y_size, 16);
+        assert_eq!(table.cols_size_const.as_deref(), Some("veTableCols"));
+        assert_eq!(table.rows_size_const.as_deref(), Some("veTableRows"));
+        assert_eq!(table.max_elements, Some(256));
+        assert!(table.is_resizable());
+    }
+
+    /// `[AxB]` is column-first, the order TunerStudio uses and the order the
+    /// `[{cols}x{rows}]` arm of `parse_shape_field` already used. rusEFI's
+    /// `demo.ini` is unambiguous: `cltIdleCorrTable = array, U08, 10378, [8x3]`
+    /// has an eight-entry `xBins` and a three-entry `yBins`, and
+    /// `scriptTable4 = [10x8]` a ten-entry `xBins` and an eight-entry `yBins`.
+    /// This test used to assert the opposite (row-first) reading, which only
+    /// went unnoticed because every checked-in fixture array is square.
+    #[test]
+    fn test_table_size_from_2d_map() {
+        // Test that x_size/y_size can be inferred from the 2D map constant
+        let content = r#"
+[MegaTune]
+signature = "TestECU"
+
+[Constants]
+page = 1
+   veTable = array, U08, 0, [8x12], "%", 1.0, 0.0
+
+[TableEditor]
+table = veTable1, veTableMap, "VE Table"
+  zBins = veTable
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        let table = def.tables.get("veTable1").unwrap();
+
+        // When x_bins and y_bins are not specified, infer from the 2D map
+        assert_eq!(table.x_size, 8, "x_size should be 8 (cols from [8x12])");
+        assert_eq!(table.y_size, 12, "y_size should be 12 (rows from [8x12])");
+    }
+
+    #[test]
+    fn test_frontpage_parsing() {
+        let content = r#"
+[MegaTune]
+signature = "TestECU"
+
+[FrontPage]
+gauge1 = tachometer
+gauge2 = throttleGauge
+gauge3 = mapGauge
+gauge4 = cltGauge
+gauge5 = afrGauge
+gauge6 = advanceGauge
+gauge7 = batteryGauge
+gauge8 = iatGauge
+
+indicator = { running }, "Not Running", "Running", white, black, green, black
+indicator = { sync }, "No Sync", "Full Sync", white, black, green, black
+indicator = { (tps > tpsflood) && (rpm < crankRPM) }, "FLOOD OFF", "FLOOD CLEAR", white, black, red, black
+"#;
+
+        let def = parse_ini(content).expect("Should parse successfully");
+
+        // Check that FrontPage was parsed
+        assert!(def.frontpage.is_some(), "FrontPage should be parsed");
+        let frontpage = def.frontpage.unwrap();
+
+        // Check gauge references
+        assert_eq!(frontpage.gauges.len(), 8, "Should have 8 gauges");
+        assert_eq!(frontpage.gauges[0], "tachometer");
+        assert_eq!(frontpage.gauges[1], "throttleGauge");
+        assert_eq!(frontpage.gauges[7], "iatGauge");
+
+        // Check indicators
+        assert_eq!(frontpage.indicators.len(), 3, "Should have 3 indicators");
+
+        let ind1 = &frontpage.indicators[0];
+        assert_eq!(ind1.expression, "running");
+        assert_eq!(ind1.label_off, "Not Running");
+        assert_eq!(ind1.label_on, "Running");
+        assert_eq!(ind1.bg_off, "white");
+        assert_eq!(ind1.fg_off, "black");
+        assert_eq!(ind1.bg_on, "green");
+        assert_eq!(ind1.fg_on, "black");
+
+        let ind3 = &frontpage.indicators[2];
+        assert_eq!(ind3.expression, "(tps > tpsflood) && (rpm < crankRPM)");
+        assert_eq!(ind3.label_off, "FLOOD OFF");
+        assert_eq!(ind3.label_on, "FLOOD CLEAR");
+        assert_eq!(ind3.bg_on, "red");
+    }
+
+    #[test]
+    fn test_extract_help_text() {
+        // Test with help text (TunerStudio format with + prefix)
+        let (name, help) = extract_help_text("bias_resistor;+Pull-up resistor value on your board");
+        assert_eq!(name, "bias_resistor");
+        assert_eq!(
+            help,
+            Some("Pull-up resistor value on your board".to_string())
+        );
+
+        // Test with help text and quoted units suffix
+        let (name, help) =
+            extract_help_text("bias_resistor;+Pull-up resistor value on your board;\"Ohm\"");
+        assert_eq!(name, "bias_resistor");
+        assert_eq!(
+            help,
+            Some("Pull-up resistor value on your board".to_string())
+        );
+
+        // Test with help text in quotes
+        let (name, help) =
+            extract_help_text("baseFuelMass;+\"Base mass of the per-cylinder fuel injected\"");
+        assert_eq!(name, "baseFuelMass");
+        assert_eq!(
+            help,
+            Some("Base mass of the per-cylinder fuel injected".to_string())
+        );
+
+        // Test without + prefix (no tooltip should be shown per TunerStudio spec)
+        let (name, help) = extract_help_text("field_name;This text should not appear");
+        assert_eq!(name, "field_name");
+        assert_eq!(help, None);
+
+        // Test with no semicolon (no help text)
+        let (name, help) = extract_help_text("simple_field");
+        assert_eq!(name, "simple_field");
+        assert_eq!(help, None);
+
+        // Test with whitespace
+        let (name, help) = extract_help_text("  field_name  ;  +  Help text with spaces  ");
+        assert_eq!(name, "field_name");
+        assert_eq!(help, Some("Help text with spaces".to_string()));
+    }
+
+    #[test]
+    fn test_commented_out_property_is_not_a_property() {
+        // A commented-out property must be stripped entirely. The stock
+        // Speeduino INI carries a disabled alternative for fuelLoadBins; before
+        // this was handled, the leading ';' was preserved (because the line
+        // contains '=') and the entry parsed with an empty name.
+        assert_eq!(
+            strip_comment(
+                "      ;fuelLoadBins = array,  U08,   272, [  16], \"kPa\", 2.0, 0.0, 0.0, 511.0, 0"
+            ),
+            ""
+        );
+
+        // Documentation/template comments in INI headers are also properties
+        // syntactically, and must stay comments.
+        assert_eq!(
+            strip_comment("   ; keyword = referenceName, DisplayName"),
+            ""
+        );
+        assert_eq!(strip_comment(";settingOption = BOOSTPSI, \"PSI\""), "");
+
+        // Help-text syntax always has a field name before the ';', so it is
+        // unaffected: the semicolon before '=' is still preserved.
+        assert_eq!(
+            strip_comment("bias_resistor;+Pull-up resistor = 4700"),
+            "bias_resistor;+Pull-up resistor = 4700"
+        );
+
+        // Trailing comments after a value are still stripped as before.
+        assert_eq!(
+            strip_comment("someField = 42 ; trailing note").trim(),
+            "someField = 42"
+        );
+    }
+
+    /// `#set` and `#unset` used to run before the branch-suppression check, so
+    /// a symbol defined inside a dead `#if` arm leaked into the live one.
+    /// `#define` and `#include` already gate on `condition_stack`.
+    #[test]
+    #[serial(default_symbols)]
+    fn set_and_unset_are_ignored_inside_a_false_branch() {
+        set_default_symbols(Vec::<String>::new());
+
+        let ini = concat!(
+            "[Constants]\n",
+            "page = 1\n",
+            "#if NEVER_DEFINED\n",
+            "#set LEAKED\n",
+            "#endif\n",
+            "#if LEAKED\n",
+            "leaked = scalar, U08, 0, \"x\", 1, 0, 0, 255, 0\n",
+            "#else\n",
+            "clean = scalar, U08, 0, \"y\", 1, 0, 0, 255, 0\n",
+            "#endif\n",
+        );
+
+        let def = parse_ini(ini).expect("parses");
+        assert!(
+            !def.constants.contains_key("leaked"),
+            "#set inside a false #if leaked into the live branch"
+        );
+        assert!(def.constants.contains_key("clean"));
+    }
+
+    /// `#unset` in a dead branch must not clear a live symbol either.
+    #[test]
+    #[serial(default_symbols)]
+    fn unset_inside_a_false_branch_does_not_clear_a_live_symbol() {
+        set_default_symbols(Vec::<String>::new());
+
+        let ini = concat!(
+            "[Constants]\n",
+            "page = 1\n",
+            "#set KEEPME\n",
+            "#if NEVER_DEFINED\n",
+            "#unset KEEPME\n",
+            "#endif\n",
+            "#if KEEPME\n",
+            "kept = scalar, U08, 0, \"x\", 1, 0, 0, 255, 0\n",
+            "#endif\n",
+        );
+
+        let def = parse_ini(ini).expect("parses");
+        assert!(
+            def.constants.contains_key("kept"),
+            "#unset inside a false #if cleared a live symbol"
+        );
+    }
+
+    /// `settingOption` lines belong to the `settingGroup` above them.
+    /// `setting_groups` is a `HashMap`, so `.iter_mut().last()` picked an
+    /// arbitrary group - Rust seeds hash order per map instance.
+    #[test]
+    #[serial(default_symbols)]
+    fn setting_options_attach_to_the_group_that_precedes_them() {
+        set_default_symbols(Vec::<String>::new());
+
+        let mut ini = String::from("[SettingGroups]\n");
+        for i in 0..8 {
+            ini.push_str(&format!("settingGroup = grp{i}, \"Group {i}\"\n"));
+            ini.push_str(&format!("settingOption = opt{i}, \"Option {i}\"\n"));
+        }
+
+        let def = parse_ini(&ini).expect("parses");
+        assert_eq!(def.setting_groups.len(), 8);
+        for i in 0..8 {
+            let group = def
+                .setting_groups
+                .get(&format!("grp{i}"))
+                .unwrap_or_else(|| panic!("grp{i} missing"));
+            assert_eq!(
+                group
+                    .options
+                    .iter()
+                    .map(|o| o.value.as_str())
+                    .collect::<Vec<_>>(),
+                vec![format!("opt{i}").as_str()],
+                "grp{i} got the wrong options: {:?}",
+                group.options
+            );
+        }
+    }
+
+    /// `settingSelector`/`settingOption` inside a dialog must produce a
+    /// `SettingSelector` component with its options attached.
+    #[test]
+    #[serial(default_symbols)]
+    fn setting_selector_parses_options_with_assignments() {
+        set_default_symbols(Vec::<String>::new());
+
+        let ini = concat!(
+            "[MegaTune]\n",
+            "signature = \"x\"\n",
+            "queryCommand = \"Q\"\n",
+            "[UserDefined]\n",
+            "dialog = sensorCal, \"Calibrate MAP/Baro\"\n",
+            "\tsettingSelector = \"Common MAP Sensors\", {iat_adcChannel != 0}\n",
+            "\t\tsettingOption = \"MPX4115\", EngineCylinder=10.6, EngineVolume=121.7\n",
+            "\t\tsettingOption = \"GM 1-BAR\", EngineCylinder=10, EngineVolume=105\n",
+            "\tfield = \"Value At 0.0 Volts\", EngineCylinder\n",
+        );
+
+        let def = parse_ini(ini).expect("parses");
+        let dialog = def.dialogs.get("sensorCal").expect("dialog");
+        let selector = dialog
+            .components
+            .iter()
+            .find_map(|c| match c {
+                DialogComponent::SettingSelector {
+                    label,
+                    options,
+                    visibility_condition,
+                } => Some((label, options, visibility_condition)),
+                _ => None,
+            })
+            .expect("SettingSelector component present");
+        assert_eq!(selector.0, "Common MAP Sensors");
+        assert_eq!(selector.2.as_deref(), Some("iat_adcChannel != 0"));
+        assert_eq!(selector.1.len(), 2);
+        assert_eq!(selector.1[0].label, "MPX4115");
+        let names: Vec<&str> = selector.1[0]
+            .assignments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["EngineCylinder", "EngineVolume"]);
+        assert!((selector.1[0].assignments[0].value - 10.6).abs() < f64::EPSILON * 10.0);
+        assert_eq!(selector.1[1].label, "GM 1-BAR");
+        // The following `field` line still lands as a separate component.
+        assert!(dialog
+            .components
+            .iter()
+            .any(|c| matches!(c, DialogComponent::Field { .. })));
+    }
+
+    /// `$tsCanId` used to resolve to byte 0 unconditionally, which misaddresses
+    /// every page-read/write frame on a board with a non-zero CAN id.
+    /// `[Constants]` is written before `[PcVariables]` in every real INI, so
+    /// the identifiers have to be re-resolved once the variable is known.
+    #[test]
+    #[serial(default_symbols)]
+    fn can_id_substitution_uses_the_declared_default_not_zero() {
+        set_default_symbols(Vec::<String>::new());
+
+        let ini = concat!(
+            "[Constants]\n",
+            "pageIdentifier = \"\\x00$tsCanId\"\n",
+            "pageReadCommand = \"r$tsCanId%2o%2c\"\n",
+            "[PcVariables]\n",
+            "tsCanId = scalar, U08, \"\", 1, 0, 0, 15, 0\n",
+            "[Defaults]\n",
+            "defaultValue = tsCanId, 3\n",
+        );
+
+        let def = parse_ini(ini).expect("parses");
+        assert_eq!(
+            def.pc_variables.get("tsCanId"),
+            Some(&3u8),
+            "pc_variables still hard-codes 0"
+        );
+        assert_eq!(
+            def.protocol.page_identifiers.first().map(Vec::as_slice),
+            Some([0u8, 3u8].as_slice()),
+            "page identifier not re-resolved after [PcVariables]"
+        );
+        assert_eq!(
+            def.protocol.page_read_commands.first().map(String::as_str),
+            Some("r\u{3}%2o%2c")
+        );
+    }
+
+    /// `gaugeN` grows a `Vec` to `N`. The documented range is `gauge1..gauge8`,
+    /// so a malformed `gauge4000000000` used to allocate four billion strings.
+    #[test]
+    #[serial(default_symbols)]
+    fn frontpage_gauge_indices_are_capped() {
+        set_default_symbols(Vec::<String>::new());
+
+        let ini = concat!(
+            "[FrontPage]\n",
+            "gauge1 = accelGauge\n",
+            "gauge4000000000 = bogusGauge\n",
+        );
+
+        let def = parse_ini(ini).expect("parses");
+        let frontpage = def.frontpage.expect("frontpage");
+        assert!(
+            frontpage.gauges.len() <= 64,
+            "gauge vector grew to {}",
+            frontpage.gauges.len()
+        );
+        assert_eq!(
+            frontpage.gauges.first().map(String::as_str),
+            Some("accelGauge")
+        );
+    }
+}
+
+#[test]
+fn test_parse_ini_with_help_text() {
+    let content = r#"
+[MegaTune]
+signature = "test 1.0"
+queryCommand = "Q"
+
+[TunerStudio]
+iniSpecVersion = 3.0
+nPages = 1
+pageSize = 256
+
+[Constants]
+page = 0
+
+crankingRpm;+Maximum RPM below which engine is considered to be cranking = scalar, U16, 0, "RPM", 1, 0, 0, 1000, 0
+baseFuelMass;+"Base mass of the per-cylinder fuel injected during cranking. This is then modified by the multipliers for CLT, IAT, TPS etc, to give the final cranking pulse width." = scalar, F32, 2, "mg", 1, 0, 0, 100, 2
+fieldWithoutPlus;This should not appear as tooltip = scalar, U08, 6, "", 1, 0, 0, 255, 0
+normalField = scalar, U16, 7, "ms", 0.1, 0, 0, 100, 1
+injectionMode;+"Select whether fuel is injected simultaneously for all cylinders or sequentially per cylinder" = bits, U08, 9, [0:1], "Simultaneous", "Sequential", "Semi-Sequential"
+bias_resistor;+Pull-up resistor value on your board;"Ohm" = scalar, F32, 10, "Ohm", 1, 0, 0, 200000, 1
+
+[OutputChannels]
+rpm = U16, 0, "RPM", 1.0, 0.0
+"#;
+
+    let def = parse_ini(content).expect("Should parse successfully");
+
+    // Check that constants with help text have it extracted
+    let c = def
+        .constants
+        .get("crankingRpm")
+        .expect("crankingRpm should exist");
+    assert!(c.help.is_some());
+    assert_eq!(
+        c.help.as_ref().unwrap(),
+        "Maximum RPM below which engine is considered to be cranking"
+    );
+
+    let c = def
+        .constants
+        .get("baseFuelMass")
+        .expect("baseFuelMass should exist");
+    assert!(c.help.is_some());
+    assert!(c
+        .help
+        .as_ref()
+        .unwrap()
+        .contains("Base mass of the per-cylinder fuel injected"));
+
+    // Check that field without + prefix has no help
+    let c = def
+        .constants
+        .get("fieldWithoutPlus")
+        .expect("fieldWithoutPlus should exist");
+    assert!(c.help.is_none());
+
+    // Check that field without help text has none
+    let c = def
+        .constants
+        .get("normalField")
+        .expect("normalField should exist");
+    assert!(c.help.is_none());
+
+    // Check bits field with help text
+    let c = def
+        .constants
+        .get("injectionMode")
+        .expect("injectionMode should exist");
+    assert!(c.help.is_some());
+    assert!(c
+        .help
+        .as_ref()
+        .unwrap()
+        .contains("Select whether fuel is injected"));
+
+    // Check field with units suffix
+    let c = def
+        .constants
+        .get("bias_resistor")
+        .expect("bias_resistor should exist");
+    assert!(c.help.is_some());
+    assert_eq!(
+        c.help.as_ref().unwrap(),
+        "Pull-up resistor value on your board"
+    );
+}
+
+#[test]
+fn test_page_number_normalization() {
+    // Test that INI 1-based page numbers are normalized to 0-based internally
+    let content = r#"
+[MegaTune]
+signature = "test 1.0"
+queryCommand = "Q"
+
+[TunerStudio]
+iniSpecVersion = 3.0
+nPages = 2
+pageSize = 256, 128
+
+[Constants]
+page = 1
+constOnPage1 = scalar, U16, 0, "ms", 1, 0, 0, 100, 1
+
+page = 2
+constOnPage2 = scalar, U16, 0, "ms", 1, 0, 0, 100, 1
+
+[OutputChannels]
+rpm = U16, 0, "RPM", 1.0, 0.0
+"#;
+
+    let def = parse_ini(content).expect("Should parse successfully");
+
+    // INI page = 1 should be normalized to internal page 0
+    let c1 = def
+        .constants
+        .get("constOnPage1")
+        .expect("constOnPage1 should exist");
+    assert_eq!(
+        c1.page, 0,
+        "INI 'page = 1' should be normalized to internal page 0"
+    );
+
+    // INI page = 2 should be normalized to internal page 1
+    let c2 = def
+        .constants
+        .get("constOnPage2")
+        .expect("constOnPage2 should exist");
+    assert_eq!(
+        c2.page, 1,
+        "INI 'page = 2' should be normalized to internal page 1"
+    );
+}
+
+#[test]
+fn test_page_zero_in_ini() {
+    // Test edge case: some INIs might use page = 0 (should stay as 0, with saturating_sub)
+    let content = r#"
+[MegaTune]
+signature = "test 1.0"
+queryCommand = "Q"
+
+[TunerStudio]
+nPages = 1
+pageSize = 256
+
+[Constants]
+page = 0
+constOnPage0 = scalar, U16, 0, "ms", 1, 0, 0, 100, 1
+"#;
+
+    let def = parse_ini(content).expect("Should parse successfully");
+
+    // page = 0 with saturating_sub(1) should stay as 0 (not underflow)
+    let c = def
+        .constants
+        .get("constOnPage0")
+        .expect("constOnPage0 should exist");
+    assert_eq!(
+        c.page, 0,
+        "INI 'page = 0' should remain as internal page 0 (saturating_sub prevents underflow)"
+    );
+}
+
+#[test]
+fn test_last_offset_after_bits_field_does_not_advance() {
+    // Regression test: lastOffset reuses the previous constant's offset, so a
+    // field right after a bits field shares that field's offset. (A bits field
+    // is also packed into the same byte as its neighbours, so overlaying it is
+    // the intended behaviour here.)
+    let content = r#"
+[MegaTune]
+signature = "test 1.0"
+queryCommand = "Q"
+
+[TunerStudio]
+nPages = 1
+pageSize = 256
+
+[Constants]
+page = 1
+flagsByte = bits, U08, 100, [0:3], "A", "B"
+afterBits = scalar, U08, lastOffset, "counts", 1.0, 0.0, 0, 255, 0
+"#;
+
+    let def = parse_ini(content).expect("Should parse successfully");
+
+    let flags = def
+        .constants
+        .get("flagsByte")
+        .expect("flagsByte should exist");
+    assert_eq!(flags.offset, 100);
+
+    let after = def
+        .constants
+        .get("afterBits")
+        .expect("afterBits should exist");
+    assert_eq!(
+        after.offset, 100,
+        "a field right after a bits field must share its offset (bits are packed), not offset+1"
+    );
+}
+
+#[test]
+fn test_last_offset_overlays_previous_constant_not_advance() {
+    // `lastOffset` means "reuse the previous variable's offset", so two
+    // constants can present the same bytes under different scalings. This is
+    // Speeduino's page-5 fuel-target layout: `afrTable` overlays `lambdaTable`
+    // (a 256-byte 16x16 table at offset 0), and the real bin arrays follow at
+    // their own explicit offsets. If `lastOffset` wrongly advanced by the
+    // table size, `afrTable` would land at 256 -- on top of `rpmBinsAFR` and
+    // past the page end -- which is the in-car "AFR/lambda table wrong" bug.
+    let content = r#"
+[MegaTune]
+signature = "test 1.0"
+queryCommand = "Q"
+
+[TunerStudio]
+nPages = 1
+pageSize = 288
+
+[Constants]
+page = 1
+lambdaTable = array, U08, 0, [16x16], "Lambda", 0.1, 0.0, 0.0, 2.0, 3
+afrTable    = array, U08, lastOffset, [16x16], "AFR", 0.1, 0.0, 7, 25.5, 1
+rpmBinsAFR  = array, U08, 256, [16], "RPM", 100.0, 0.0, 100, 25500, 0
+"#;
+
+    let def = parse_ini(content).expect("Should parse successfully");
+
+    let lambda = def
+        .constants
+        .get("lambdaTable")
+        .expect("lambdaTable should exist");
+    assert_eq!(lambda.offset, 0);
+
+    let afr = def
+        .constants
+        .get("afrTable")
+        .expect("afrTable should exist");
+    assert_eq!(
+        afr.offset, 0,
+        "afrTable must overlay lambdaTable at the same offset (0), not advance to 256"
+    );
+
+    // A constant with an explicit offset after a lastOffset overlay is
+    // unaffected: it still starts exactly where the INI declares.
+    let rpm = def
+        .constants
+        .get("rpmBinsAFR")
+        .expect("rpmBinsAFR should exist");
+    assert_eq!(rpm.offset, 256);
+}
+
+#[test]
+fn test_last_offset_overlays_consecutive_scalar_pairs() {
+    // Speeduino's page-6 layout uses lastOffset for AFR/Lambda scalar pairs:
+    // each `*_lambda` overlays the `*_afr` byte directly before it. The next
+    // pair then advances via its own explicit offset. Verifies overlay does
+    // not "stick" across an explicitly-offset constant.
+    let content = r#"
+[MegaTune]
+signature = "test 1.0"
+queryCommand = "Q"
+
+[TunerStudio]
+nPages = 1
+pageSize = 16
+
+[Constants]
+page = 1
+ego_min_afr    = scalar, U08, 8, "AFR", 0.1, 0, 7, 25, 1
+ego_min_lambda = scalar, U08, lastOffset, "Lambda", 0.068, 0, 0.5, 1.7, 3
+ego_max_afr    = scalar, U08, 9, "AFR", 0.1, 0, 7, 25, 1
+ego_max_lambda = scalar, U08, lastOffset, "Lambda", 0.068, 0, 0.5, 1.7, 3
+"#;
+
+    let def = parse_ini(content).expect("Should parse successfully");
+
+    assert_eq!(def.constants.get("ego_min_afr").unwrap().offset, 8);
+    assert_eq!(
+        def.constants.get("ego_min_lambda").unwrap().offset,
+        8,
+        "ego_min_lambda must overlay ego_min_afr at offset 8"
+    );
+    assert_eq!(def.constants.get("ego_max_afr").unwrap().offset, 9);
+    assert_eq!(
+        def.constants.get("ego_max_lambda").unwrap().offset,
+        9,
+        "ego_max_lambda must overlay ego_max_afr at offset 9, not chain from the previous overlay"
+    );
+}
+
+#[cfg(test)]
+mod tested_symbol_tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// A definition records which symbols were *asked about*, separately from
+    /// which were active. Without that distinction the app cannot tell "this
+    /// INI has no temperature choice to make" from "the choice defaulted", and
+    /// would prompt on files that never mention units.
+    // Same process-wide DEFAULT_SYMBOLS seed as the two tests already in
+    // this group. Left out of it, this raced with them and flipped the seed
+    // between set_default_symbols and parse_ini.
+    #[test]
+    #[serial(default_symbols)]
+    fn a_definition_records_the_symbols_it_tested() {
+        set_default_symbols(Vec::<String>::new());
+        let ini = "\
+[MegaTune]
+ signature = \"test\"
+
+[OutputChannels]
+#if CELSIUS
+   coolant = { coolantRaw - 40 }
+#else
+   coolant = { (coolantRaw - 40) * 1.8 + 32 }
+#endif
+";
+        let def = parse_ini(ini).expect("parses");
+        assert!(
+            def.tests_symbol("CELSIUS"),
+            "the INI asked about CELSIUS, so there is a question to put to the user"
+        );
+        assert!(
+            !def.symbol_is_active("CELSIUS"),
+            "it was not defined, so the Fahrenheit arm was taken"
+        );
+    }
+
+    // Same process-wide DEFAULT_SYMBOLS seed as the two tests already in
+    // this group. Left out of it, this raced with them and flipped the seed
+    // between set_default_symbols and parse_ini.
+    #[test]
+    #[serial(default_symbols)]
+    fn an_ini_that_never_asks_records_nothing() {
+        set_default_symbols(Vec::<String>::new());
+        let ini = "\
+[MegaTune]
+ signature = \"test\"
+
+[OutputChannels]
+   coolant = scalar, U08, 0, \"C\", 1.0, 0.0
+";
+        let def = parse_ini(ini).expect("parses");
+        assert!(
+            !def.tests_symbol("CELSIUS"),
+            "nothing to ask about - prompting here would be noise"
+        );
+    }
+
+    /// The arm taken must not change what was recorded as tested: the question
+    /// was asked either way.
+    // Same process-wide DEFAULT_SYMBOLS seed as the two tests already in
+    // this group. Left out of it, this raced with them and flipped the seed
+    // between set_default_symbols and parse_ini.
+    #[test]
+    #[serial(default_symbols)]
+    fn the_symbol_is_recorded_even_when_defined() {
+        set_default_symbols(vec!["CELSIUS".to_string()]);
+        let ini = "\
+[MegaTune]
+ signature = \"test\"
+
+[OutputChannels]
+#if CELSIUS
+   coolant = { coolantRaw - 40 }
+#endif
+";
+        let def = parse_ini(ini).expect("parses");
+        set_default_symbols(Vec::<String>::new());
+        assert!(def.tests_symbol("CELSIUS"));
+        assert!(def.symbol_is_active("CELSIUS"));
+    }
+}
+
+#[cfg(test)]
+mod datalog_entry_tests {
+    use super::*;
+
+    fn parse(line: &str) -> DatalogEntry {
+        let mut def = EcuDefinition::default();
+        parse_datalog_entry(&mut def, "entry", line);
+        def.datalog_entries.pop().expect("one entry")
+    }
+
+    /// Columns are Channel, Label, Type, Format - per the INI's own header
+    /// comment. The type used to be read as the format, and the format as an
+    /// enabled flag that was never the string "0".
+    #[test]
+    fn the_type_and_format_columns_are_not_swapped() {
+        let e = parse(r#"rpm, "RPM", int, "%d""#);
+        assert_eq!(e.channel, "rpm");
+        assert_eq!(e.label, "RPM");
+        assert_eq!(e.data_type, "int");
+        assert_eq!(e.format, "%d");
+        assert!(e.condition.is_none());
+
+        let e = parse(r#"time, "Time", float, "%.3f""#);
+        assert_eq!(e.data_type, "float");
+        assert_eq!(e.format, "%.3f");
+    }
+
+    /// 62 of the 112 entries in the Speeduino 202501 INI carry a condition.
+    #[test]
+    fn a_declared_condition_is_kept() {
+        let e = parse(r#"stagingActive, "Fuel Staging", int, "onOff", { stagingEnabled }"#);
+        assert_eq!(e.channel, "stagingActive");
+        assert_eq!(e.format, "onOff");
+        assert_eq!(e.condition.as_deref(), Some("stagingEnabled"));
+    }
+
+    /// A condition can contain commas, which is why this uses split_ini_line
+    /// rather than split(','). The naive split shattered the expression and
+    /// left the tail as extra fields.
+    #[test]
+    fn a_condition_containing_commas_survives() {
+        let e = parse(
+            r#"boostDuty, "Boost Duty", int, "%d", { bitStringValue(boostLabels, boostType) }"#,
+        );
+        assert_eq!(e.channel, "boostDuty");
+        assert_eq!(e.format, "%d");
+        assert_eq!(
+            e.condition.as_deref(),
+            Some("bitStringValue(boostLabels, boostType)")
+        );
+    }
+
+    /// A short line must still yield a usable entry rather than a panic.
+    #[test]
+    fn a_two_field_entry_falls_back_sensibly() {
+        let e = parse(r#"afr, "AFR""#);
+        assert_eq!(e.channel, "afr");
+        assert_eq!(e.label, "AFR");
+        assert_eq!(e.data_type, "float");
+        assert_eq!(e.format, "%.2f");
+    }
+}
+
+#[cfg(test)]
+mod analysis_filter_tests {
+    use super::*;
+
+    fn parse(line: &str) -> AnalysisFilter {
+        parse_analysis_filter(line).expect("parses")
+    }
+
+    /// The shape the shipping Speeduino INI actually uses: seven fields, with a
+    /// blank between the default value and the flag. A fixed parts[5] read the
+    /// blank, so every filter came out not user-adjustable.
+    #[test]
+    fn the_real_seven_field_form_finds_the_flag() {
+        let f = parse(r#"minCltFilter, "Minimum CLT", coolant, <, 71, , true"#);
+        assert_eq!(f.name, "minCltFilter");
+        assert_eq!(f.channel, "coolant");
+        assert_eq!(f.default_value, 71.0);
+        assert!(f.user_adjustable, "the flag is at index 6, not 5");
+    }
+
+    /// The six-field form the INI's own comment documents must still work.
+    #[test]
+    fn the_documented_six_field_form_still_works() {
+        let f = parse(r#"minRPMFilter, "Minimum RPM", RPMValue, <, 500, true"#);
+        assert!(f.user_adjustable);
+    }
+
+    /// A filter genuinely declared false stays false either way round.
+    #[test]
+    fn a_false_flag_is_honoured_in_both_shapes() {
+        assert!(!parse(r#"accelFilter, "Accel Flag", engine, &, 16, , false"#).user_adjustable);
+        assert!(!parse(r#"accelFilter, "Accel Flag", engine, &, 16, false"#).user_adjustable);
+    }
+
+    /// parse_ini_bool accepts the other spellings an INI may use, and strips a
+    /// trailing comment.
+    #[test]
+    fn the_other_truthy_spellings_are_accepted() {
+        assert!(parse(r#"f, "F", coolant, <, 1, , 1"#).user_adjustable);
+        assert!(parse(r#"f, "F", coolant, <, 1, , yes"#).user_adjustable);
+        assert!(parse(r#"f, "F", coolant, <, 1, , true ; adjustable"#).user_adjustable);
+    }
+}

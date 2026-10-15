@@ -1,0 +1,285 @@
+//! Update constant value command.
+
+use crate::AppState;
+use tauri::Emitter;
+
+#[tauri::command]
+pub async fn update_constant(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    name: String,
+    value: f64,
+) -> Result<(), String> {
+    update_constant_internal(&state, name.clone(), value).await?;
+
+    // Re-resolve `{expression}`-valued scale/translate fields when the edited
+    // constant feeds one (Speeduino: `algorithm` → `fuelLoadRes` → the VE
+    // load-axis scale). Runs after the internal write has returned, so none
+    // of its guards are held here.
+    resolve_scales_if_needed(&app, &state, &name).await;
+
+    Ok(())
+}
+
+/// Re-resolve `{expression}`-valued scale/translate fields if the just-edited
+/// constant feeds one, and tell the frontend when scales actually changed.
+///
+/// Speeduino's load axes scale by `{fuelLoadRes}`, which is
+/// `((algorithm == 0) || (algorithm == 2)) ? 2.000 : 0.500`: switching the
+/// fuel algorithm (MAP → TPS for Alpha-N / ITB setups) must re-scale the VE
+/// table's load axis immediately, or tables keep rendering with the old
+/// factor until the next full sync (issue #132).
+///
+/// Must run with no guards held: `resolve_scales_from_tune` locks the
+/// definition and tune state itself.
+async fn resolve_scales_if_needed(app: &tauri::AppHandle, state: &AppState, name: &str) {
+    let feeds_dynamic_scale = {
+        let def_guard = state.definition.lock().await;
+        let Some(def) = def_guard.as_ref() else {
+            return;
+        };
+        def.constant_feeds_dynamic_scale(name)
+    };
+    if !feeds_dynamic_scale {
+        return;
+    }
+
+    let resolved = crate::commands::load_tune::resolve_scales_from_tune(state).await;
+    if resolved > 0 {
+        // Axis scales changed: open tables and dialogs must re-read their
+        // bins. `tune:loaded` is the established refresh signal (consumed by
+        // refreshOpenTabs in App.tsx and PanelComponents' reload tick).
+        let _ = app.emit("tune:loaded", "scales-resolved");
+    }
+}
+
+pub(crate) async fn update_constant_internal(
+    state: &AppState,
+    name: String,
+    value: f64,
+) -> Result<(), String> {
+    // Snapshot only what we need from the definition, then drop the lock before
+    // doing any ECU I/O below. Holding `state.definition` across a blocking
+    // conn.read_memory()/write_memory() call starves every other command that
+    // needs the definition (e.g. load_tune) if the ECU I/O stalls.
+    let def_guard = state.definition.lock().await;
+    let def = def_guard.as_ref().ok_or("Definition not loaded")?;
+    let constant = def
+        .constants
+        .get(&name)
+        .ok_or_else(|| format!("Constant {} not found", name))?
+        .clone();
+    let endianness = def.endianness;
+    drop(def_guard);
+
+    // Block assigning a pin that another output already uses (rusEFI Settings Error).
+    if constant.data_type == libretune_core::ini::DataType::Bits {
+        crate::commands::pin_conflicts::deny_if_pin_conflict(state, &name, value).await?;
+    }
+
+    let mut conn_guard = state.connection.lock().await;
+    let mut cache_guard = state.tune_cache.lock().await;
+
+    // PC variables are stored locally, not on ECU
+    if constant.is_pc_variable {
+        if let Some(cache) = cache_guard.as_mut() {
+            cache.local_values.insert(name.clone(), value);
+        }
+        // Also update tune.constants for consistency
+        let mut tune_guard = state.current_tune.lock().await;
+        if let Some(tune) = tune_guard.as_mut() {
+            tune.constants
+                .insert(name, libretune_core::tune::TuneValue::Scalar(value));
+        }
+        return Ok(());
+    }
+
+    // Handle bits constants specially (they're packed, size_bytes() == 0)
+    if constant.data_type == libretune_core::ini::DataType::Bits {
+        let bit_pos = constant.bit_position.unwrap_or(0);
+        let bit_size = constant.bit_size.unwrap_or(1);
+
+        // Calculate which byte contains the bits and the bit position within that byte
+        let byte_offset = (bit_pos / 8) as u16;
+        let bit_in_byte = bit_pos % 8;
+
+        // Calculate how many bytes we need to read/write (may span multiple bytes)
+        let bits_remaining_after_first_byte = bit_size.saturating_sub(8 - bit_in_byte);
+        let bytes_needed: usize = if bits_remaining_after_first_byte > 0 {
+            (1 + bits_remaining_after_first_byte.div_ceil(8)) as usize
+        } else {
+            1
+        };
+
+        let read_offset = constant.offset + byte_offset;
+        let new_bit_val = value as u32;
+
+        let mut existing_bytes = if let Some(cache) = cache_guard.as_ref() {
+            cache
+                .read_bytes(constant.page, read_offset, bytes_needed as u16)
+                .map(|b| b.to_vec())
+        } else {
+            None
+        };
+        if existing_bytes.is_none() {
+            if let Some(conn) = conn_guard.as_mut() {
+                let params = libretune_core::protocol::commands::ReadMemoryParams {
+                    can_id: 0,
+                    page: constant.page,
+                    offset: read_offset,
+                    length: bytes_needed as u16,
+                };
+                if let Ok(bytes) = conn.read_memory(params) {
+                    if bytes.len() >= bytes_needed {
+                        existing_bytes = Some(bytes[..bytes_needed].to_vec());
+                    }
+                }
+            }
+        }
+        let mut existing_bytes = existing_bytes
+            .ok_or_else(|| format!("Cannot update bits constant '{name}': page not loaded"))?;
+
+        // Apply the new bit value using masks
+        // For single-byte case (most common for flags like [1:1])
+        if bytes_needed == 1 {
+            let mask = if bit_size >= 8 {
+                0xFF
+            } else {
+                ((1u8 << bit_size) - 1) << bit_in_byte
+            };
+            existing_bytes[0] =
+                (existing_bytes[0] & !mask) | (((new_bit_val as u8) << bit_in_byte) & mask);
+        } else {
+            // Multi-byte case: apply bits across multiple bytes
+            let bits_in_first_byte = (8 - bit_in_byte).min(bit_size);
+            let mask_first = if bits_in_first_byte >= 8 {
+                0xFF
+            } else {
+                ((1u8 << bits_in_first_byte) - 1) << bit_in_byte
+            };
+            let val_first = ((new_bit_val as u8) << bit_in_byte) & mask_first;
+            existing_bytes[0] = (existing_bytes[0] & !mask_first) | val_first;
+
+            let mut bits_written = bits_in_first_byte;
+            for byte in existing_bytes.iter_mut().skip(1) {
+                let remaining_bits = bit_size - bits_written;
+                if remaining_bits == 0 {
+                    break;
+                }
+                let bits_for_this_byte = remaining_bits.min(8);
+                let mask = if bits_for_this_byte >= 8 {
+                    0xFF
+                } else {
+                    (1u8 << bits_for_this_byte) - 1
+                };
+                let val_for_byte = ((new_bit_val >> bits_written) as u8) & mask;
+                *byte = (*byte & !mask) | val_for_byte;
+                bits_written += bits_for_this_byte;
+            }
+        }
+
+        // Write modified bytes to cache
+        if let Some(cache) = cache_guard.as_mut() {
+            cache.write_bytes(constant.page, read_offset, &existing_bytes);
+        }
+
+        // Update TuneFile in memory (both pages and constants)
+        let mut tune_guard = state.current_tune.lock().await;
+        if let Some(tune) = tune_guard.as_mut() {
+            // Update page data
+            tune.patch_page_bytes(constant.page, read_offset, &existing_bytes);
+
+            // Update constants HashMap for offline reads
+            tune.constants
+                .insert(name.clone(), libretune_core::tune::TuneValue::Scalar(value));
+        }
+
+        // Mark tune as modified
+        *state.tune_modified.lock().await = true;
+
+        // Write to ECU if connected
+        if let Some(conn) = conn_guard.as_mut() {
+            let params = libretune_core::protocol::commands::WriteMemoryParams {
+                can_id: 0,
+                page: constant.page,
+                offset: read_offset,
+                data: existing_bytes,
+            };
+            // A failed ECU write must not report success: the cache,
+            // `current_tune` and `tune_modified` are already committed here, so
+            // swallowing the error leaves the app's copy silently diverged from
+            // the ECU. Offline editing is the `conn_guard == None` case, not this.
+            conn.write_memory(params)
+                .map_err(|e| format!("Failed to write bits constant '{name}' to ECU: {e}"))?;
+        }
+
+        eprintln!(
+            "[DEBUG] update_constant: Updated bits constant '{}' to value {}",
+            name, value
+        );
+        return Ok(());
+    }
+
+    // Convert display value to raw bytes (for non-bits constants)
+    let raw_val = constant.display_to_raw(value);
+    let mut raw_data = vec![0u8; constant.size_bytes()];
+    constant
+        .data_type
+        .write_to_bytes(&mut raw_data, 0, raw_val, endianness);
+
+    // Always write to TuneCache if available (enables offline editing)
+    if let Some(cache) = cache_guard.as_mut() {
+        if cache.write_bytes(constant.page, constant.offset, &raw_data) {
+            // Also update TuneFile in memory
+            let mut tune_guard = state.current_tune.lock().await;
+            if let Some(tune) = tune_guard.as_mut() {
+                // Get or create page data
+                tune.patch_page_bytes(constant.page, constant.offset, &raw_data);
+
+                // Update constants HashMap for offline reads
+                tune.constants
+                    .insert(name.clone(), libretune_core::tune::TuneValue::Scalar(value));
+            }
+
+            // Mark tune as modified
+            *state.tune_modified.lock().await = true;
+        }
+    }
+
+    // Write to ECU if connected (optional - offline mode works without this)
+    if let Some(conn) = conn_guard.as_mut() {
+        let params = libretune_core::protocol::commands::WriteMemoryParams {
+            can_id: 0,
+            page: constant.page,
+            offset: constant.offset,
+            data: raw_data.clone(),
+        };
+
+        // Offline mode is the `conn_guard == None` case above. Once a
+        // connection exists, a failed write is a real failure: the cache and
+        // `current_tune` already hold the new value, so returning Ok here would
+        // leave the app showing a value the ECU never took.
+        conn.write_memory(params)
+            .map_err(|e| format!("Failed to write constant '{name}' to ECU: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Write an array-valued constant, e.g. `taeBins` or `taeRates`.
+///
+/// Curves go through `update_curve_data`, but not every array is a curve: the
+/// accel-enrichment bins and rates are plain array constants, so there was no
+/// exposed way to write them at all and they could only be edited by hand in
+/// another tool.
+#[tauri::command]
+pub async fn update_constant_array(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    values: Vec<f64>,
+) -> Result<(), String> {
+    if values.is_empty() {
+        return Err("No values provided".to_string());
+    }
+    crate::commands::table_internals::update_constant_array_internal(&state, &name, values).await
+}
